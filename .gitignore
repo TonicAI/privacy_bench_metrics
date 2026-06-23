@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# evaluation run outputs
+synthesis_evaluation/runs/
+.DS_Store
