@@ -1,6 +1,6 @@
 # privacy_bench_metrics
 
-The evaluation code for **[PrivacyBench](https://huggingface.co/datasets/TonicAI/privacy_bench)** —
+The evaluation code for **[PrivacyBench](https://huggingface.co/datasets/TonicAI/Privacy-Bench)** —
 a benchmark for synthesizing personal workplace data (detecting PII in
 emails/Slack messages and replacing it with coherent synthetic values).
 
@@ -20,7 +20,7 @@ truth and reports three metrics:
 
 The dataset itself (inputs, ground-truth spans, and character rosters)
 lives on Hugging Face:
-**https://huggingface.co/datasets/TonicAI/privacy_bench**
+**https://huggingface.co/datasets/TonicAI/Privacy-Bench**
 
 ## Install
 
