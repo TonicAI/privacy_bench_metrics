@@ -1,4 +1,4 @@
-"""Recall (mask-rate) against the ground truth.
+"""NER recall (detection) against the ground truth.
 
 We don't compute precision or F1: the ground-truth spans aren't an
 exhaustive listing of every PII string the synthesizer might also have
@@ -6,15 +6,15 @@ masked, so "predicted-but-not-in-gold" is not a meaningful error.
 
 Recall definition
 -----------------
-For every ground-truth span in scope:
-  - TRUE POSITIVE  ⇔ some predicted entity overlaps the gold span AND
-                     its `new_text` differs from its `text`. The gold
-                     PII was detected AND replaced with a new value.
-  - FALSE NEGATIVE ⇔ everything else (no overlapping prediction, or an
-                     overlapping prediction whose `new_text` equals its
-                     `text`).
+Detection only — whether the value was actually *changed* is scored
+separately, as synthesis accuracy (see metrics.py). For every
+ground-truth span in scope:
+  - TRUE POSITIVE  ⇔ some predicted entity overlaps the gold span.
+  - FALSE NEGATIVE ⇔ no overlapping prediction: the gold PII was never
+                     detected at all.
 
-Recall = tp / (tp + fn), reported overall and per label.
+Recall = tp / (tp + fn), reported overall and per label; the
+denominator is always the total gold-span count.
 """
 from __future__ import annotations
 
@@ -57,9 +57,8 @@ def score(rows: List[EvalRow]) -> dict:
         gts = [g for g in row.ground_truth_spans if g.label in LABELS]
         preds = list(row.synthesis.entities or [])
         for g in gts:
-            p = _best_overlap(g, preds)
-            masked = p is not None and p.new_text != p.text
-            if masked:
+            detected = _best_overlap(g, preds) is not None
+            if detected:
                 tp[g.label] += 1
                 for cid in g.characters:
                     per_char_tp[cid][g.label] += 1
@@ -71,7 +70,7 @@ def score(rows: List[EvalRow]) -> dict:
                 if len(fn_examples) < TOP_K_FN:
                     fn_examples.append({
                         "row_idx": row_idx,
-                        "cell_id": row.meta.get("cell_id"),
+                        "cell_id": row.meta.get("row_id") or row.meta.get("cell_id"),
                         "gold": {"text": g.text, "label": g.label,
                                  "start": g.start, "end": g.end,
                                  "characters": list(g.characters)},

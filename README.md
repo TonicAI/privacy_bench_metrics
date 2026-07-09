@@ -5,18 +5,28 @@ a benchmark for synthesizing personal workplace data (detecting PII in
 emails/Slack messages and replacing it with coherent synthetic values).
 
 This repo scores a synthesizer's output against the benchmark's ground
-truth and reports three metrics:
+truth and reports three metrics with fixed denominators, so each stage's
+failures land in exactly one column:
 
 1. **NER recall** — of the gold PII spans, the fraction the synthesizer
-   both detected *and* replaced. `TP / (TP + FN)`. A miss is a privacy
-   leak, so this is the primary detection axis.
-2. **Synthesis accuracy** — of the spans that *were* detected and
-   replaced, the fraction whose synthetic value is coherent, judged by an
-   LLM against each character's PII. `coherent / (coherent + incoherent)`.
-3. **Synthesis + NER accuracy** — the bottom-line score, folding
-   detection misses into the denominator so a pipeline cannot inflate its
-   number by detecting less.
-   `coherent / (coherent + incoherent + missed)`.
+   detected (detection only — replacement is scored separately).
+   `detected / gold`. The denominator is always the total gold-span
+   count.
+2. **Synthesis accuracy** — of the detected gold spans, the fraction
+   whose synthetic value is coherent, judged by an LLM against each
+   character's PII. `coherent / detected`. An identity mapping
+   (`new_text` equal to `text` — the value was detected but not
+   actually changed) always counts as a miss, and spans the judge
+   failed to evaluate stay in the denominator.
+3. **Synthesis + NER accuracy** — the bottom-line, end-to-end score: of
+   all gold PII spans, the fraction that was detected *and* coherently
+   replaced. `coherent / gold`. Equals NER recall × synthesis accuracy,
+   and a pipeline cannot inflate it by detecting less.
+
+Each stage's failures land in exactly one metric: a span the NER step
+missed only hurts recall, a detected span that was left unchanged or
+replaced incoherently only hurts synthesis accuracy, and the combined
+score is their product.
 
 The dataset itself (inputs, ground-truth spans, and character rosters)
 lives on Hugging Face:
@@ -51,8 +61,8 @@ synthetic replacements, joined to the ground truth by `row_id`:
 
 `start`/`end` are character offsets into the original message text;
 `label` ∈ {`NAME_GIVEN`, `NAME_FAMILY`, `EMAIL_ADDRESS`, `USERNAME`,
-`ORGANIZATION`}; an entity counts as "detected and replaced" only when
-`new_text` differs from `text`.
+`ORGANIZATION`}. An entity whose `new_text` equals its `text` counts as
+detected but not synthesized — it scores as a synthesis miss.
 
 ## Run
 
@@ -69,10 +79,14 @@ python -m synthesis_evaluation.run_eval \
 
 This writes `synthesis_evaluation/runs/my_run/` with:
 
-- `results.json` — the metrics as structured data,
-- `summary.md` — the three headline scores + per-entity-type tables,
-- `viewer.html` — an interactive view of missed PII and the judge's
-  incoherent verdicts.
+- `results.json` — the three headline scores as structured data
+  (overall, per entity type, and per character, under `metrics`), plus
+  supporting detail (missed-PII examples and the judge's raw verdicts,
+  under `detail`),
+- `summary.md` — the headline scores + per-entity-type and
+  per-character tables,
+- `viewer.html` — an interactive view of missed PII, PII left
+  unchanged, and the judge's incoherent verdicts.
 
 To score only detection (no API key, no roster), add `--skip-llm-judge`
 and drop `--characters`.

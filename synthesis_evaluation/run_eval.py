@@ -21,8 +21,9 @@ Output-file schema (one JSON object per line)::
 ``label`` is one of NAME_GIVEN, NAME_FAMILY, EMAIL_ADDRESS, USERNAME,
 ORGANIZATION. ``start``/``end`` are character offsets into the original
 message text (from the ground-truth file). ``text`` is the original PII
-surface and ``new_text`` its synthetic replacement; an entity counts as
-"detected and replaced" only when ``new_text`` differs from ``text``.
+surface and ``new_text`` its synthetic replacement; an entity whose
+``new_text`` equals its ``text`` counts as detected but not synthesized
+(a synthesis-accuracy miss).
 
 Writes ``results.json``, ``summary.md``, and ``viewer.html`` into the
 run directory.
@@ -36,9 +37,11 @@ Usage
         --characters   ground_truth/megan_donovan_eli_lilly_characters_ground_truth.json \\
         --run-name     megan_donovan_eli_lilly_xml_haiku
 
-The eval reports three metrics: NER recall, synthesis accuracy, and
-synthesis + NER accuracy. The latter two come from an LLM judge that
-scores each synthetic replacement against the character's PII (from the
+The eval reports three metrics with fixed denominators (see
+metrics.py): NER recall (detected / gold), synthesis accuracy
+(coherent / detected), and synthesis + NER accuracy (coherent / gold =
+their product). The latter two come from an LLM judge that scores each
+synthetic replacement against the character's PII (from the
 ``--characters`` roster), so ``--characters`` is required unless you
 pass ``--skip-llm-judge`` to compute NER recall offline.
 """
@@ -53,6 +56,7 @@ from typing import Dict, List, Optional
 
 from . import score_recall, score_realism_llm
 from .load import load_characters, load_jsonl
+from .metrics import compute_metrics
 from .render import render
 from .types import LABELS, TIER_ENTITY, EvalRow
 
@@ -219,6 +223,19 @@ def main() -> int:
                         f"{ogt.get('coherent', 0) + ogt.get('incoherent', 0)} coherent")
         print(f"  done in {timings.get('realism_llm', 0):.1f}s — " + "; ".join(bits))
 
+    # The headline metrics (see metrics.py): detection-only NER recall,
+    # synthesis accuracy over all detected gold spans (identity mappings
+    # always count as misses), and their product as the combined score.
+    metrics = compute_metrics(rows, realism_llm)
+    o = metrics["overall"]
+
+    def _p(x: Optional[float]) -> str:
+        return f"{x:.3f}" if x is not None else "n/a"
+
+    print(f"\nscores — ner_recall={_p(o['ner_recall'])}  "
+          f"synthesis_accuracy={_p(o['synthesis_accuracy'])}  "
+          f"combined={_p(o['combined_accuracy'])}")
+
     results = {
         "config": {
             "predictions": str(args.predictions),
@@ -229,9 +246,14 @@ def main() -> int:
             "tier": tier,
         },
         "timings_sec": timings,
-        "metrics": {
-            "recall":      recall,
-            "realism_llm": realism_llm,
+        # The three headline scores at every granularity (overall,
+        # by_label, per_character) plus identity-mapping diagnostics.
+        "metrics": metrics,
+        # Supporting evidence: the detection scorer's FN examples and
+        # per-character breakdown, and the judge's raw verdicts.
+        "detail": {
+            "recall": recall,
+            "judge":  realism_llm,
         },
     }
 
