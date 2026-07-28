@@ -9,12 +9,18 @@ Recall definition
 Detection only — whether the value was actually *changed* is scored
 separately, as synthesis accuracy (see metrics.py). For every
 ground-truth span in scope:
-  - TRUE POSITIVE  ⇔ some predicted entity overlaps the gold span.
-  - FALSE NEGATIVE ⇔ no overlapping prediction: the gold PII was never
-                     detected at all.
+  - TRUE POSITIVE  ⇔ a predicted entity with the gold span's label
+                     overlaps the gold span.
+  - FALSE NEGATIVE ⇔ no label-matched overlapping prediction: the gold
+                     PII was never detected, or was detected only under
+                     a different label.
 
 Recall = tp / (tp + fn), reported overall and per label; the
 denominator is always the total gold-span count.
+
+``_match_pred`` — the label-matched largest-overlap matcher — is the
+single span-matching rule shared by every scorer (detection here, the
+judge's mapping join in score_realism_llm, and metrics.py).
 """
 from __future__ import annotations
 
@@ -30,10 +36,13 @@ def _overlaps(a_s: int, a_e: int, b_s: int, b_e: int) -> bool:
     return a_s < b_e and b_s < a_e
 
 
-def _best_overlap(g: GroundTruthSpan, preds: List[SynthEntity]) -> Optional[SynthEntity]:
-    """Pick the predicted entity with the largest overlap onto `g`."""
+def _match_pred(g: GroundTruthSpan, preds: List[SynthEntity]) -> Optional[SynthEntity]:
+    """The predicted entity with the gold span's label and the largest
+    overlap onto `g`; None when no same-label prediction overlaps."""
     best = None
     for p in preds:
+        if p.label != g.label:
+            continue
         if _overlaps(g.start, g.end, p.start, p.end):
             ov = min(g.end, p.end) - max(g.start, p.start)
             if best is None or ov > best[0]:
@@ -57,7 +66,7 @@ def score(rows: List[EvalRow]) -> dict:
         gts = [g for g in row.ground_truth_spans if g.label in LABELS]
         preds = list(row.synthesis.entities or [])
         for g in gts:
-            detected = _best_overlap(g, preds) is not None
+            detected = _match_pred(g, preds) is not None
             if detected:
                 tp[g.label] += 1
                 for cid in g.characters:

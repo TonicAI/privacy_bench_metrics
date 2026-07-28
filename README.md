@@ -10,8 +10,10 @@ failures land in exactly one column:
 
 1. **NER recall** — of the gold PII spans, the fraction the synthesizer
    detected (detection only — replacement is scored separately).
-   `detected / gold`. The denominator is always the total gold-span
-   count.
+   `detected / gold`. Detection requires a predicted span that overlaps
+   the gold span *and carries its label* — a span found only under a
+   different label is an NER miss. The denominator is always the total
+   gold-span count.
 2. **Synthesis accuracy** — of the detected gold spans, the fraction
    whose synthetic value is coherent, judged by an LLM against each
    character's PII. `coherent / detected`. An identity mapping

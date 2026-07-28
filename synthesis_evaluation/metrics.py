@@ -3,8 +3,10 @@
 Combines the ground truth, the synthesizer's entities, and the LLM
 judge's verdicts into one classification per gold span:
 
-  detected   ⇔ some predicted entity overlaps the gold span
-               (label-agnostic, largest overlap wins)
+  detected   ⇔ a predicted entity with the gold span's label overlaps
+               the gold span (label-matched, largest overlap wins — the
+               same matching rule the judge's mapping join uses; a span
+               found only under a different label is an NER miss)
   replaced   ⇔ the label-matched prediction's new_text != text
   coherent   ⇔ replaced AND the judge marked that (surface → value)
                mapping coherent
@@ -34,8 +36,8 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
-from .score_realism_llm import CHAR_LABELS, _match_pred
-from .score_recall import _best_overlap
+from .score_realism_llm import CHAR_LABELS
+from .score_recall import _match_pred
 from .types import EvalRow, LABELS
 
 _COUNT_KEYS = ("gold", "detected", "coherent", "incoherent", "skipped")
@@ -123,13 +125,11 @@ def compute_metrics(rows: List[EvalRow], realism_llm: dict) -> dict:
                     slot[key] += 1
 
             bump("gold")
-            if _best_overlap(g, preds) is None:
-                continue                       # NER miss
-            bump("detected")
-            p = _match_pred(g, preds)          # what the judge saw
-            if p is None:
-                bump("skipped")                # detected under another label
-            elif p.new_text == p.text:
+            p = _match_pred(g, preds)          # label-matched overlap;
+            if p is None:                      # what the judge saw
+                continue                       # NER miss (not found, or
+            bump("detected")                   # found under another label)
+            if p.new_text == p.text:
                 bump("incoherent")             # identity mapping: always a miss
                 identity_text_label[(g.text, g.label)] += 1
                 if len(identity_examples) < TOP_K_IDENTITY:
