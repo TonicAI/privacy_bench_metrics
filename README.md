@@ -93,6 +93,37 @@ This writes `synthesis_evaluation/runs/my_run/` with:
 To score only detection (no API key, no roster), add `--skip-llm-judge`
 and drop `--characters`.
 
+## NER metrics against the human annotations
+
+The dataset also ships `human_annotations/<set>.jsonl` — an exhaustive
+human annotation of the email and Slack messages of six of the datasets.
+Against that gold, precision and F1 are meaningful (against the
+generated ground truth only recall is), so a second, pure-stdlib
+evaluator scores raw NER predictions per dataset, pooled (micro), and
+macro, under two matching rules: *overlap* (label-matched character
+overlap) and *exact* (identical `start`/`end`/`label`). This is the
+scoring behind the dataset card's "NER engines scored on the human
+gold" table.
+
+Predictions are one JSON line per message: a row id (`row_id`,
+`meta.row_id`, or `meta.cell_id`) plus spans under `entities` or
+`spans`, each with `start`/`end`/`label` (`new_text` is not needed;
+labels outside the five above are ignored).
+
+```bash
+DATA=/path/to/the/downloaded/dataset
+python -m synthesis_evaluation.run_ner_eval \
+  --gold "$DATA/human_annotations/*.jsonl" \
+  --predictions-dir my_ner_output \
+  --run-name my_engine_human_gold
+```
+
+`--predictions-dir` pairs each gold file with the file of the same name
+in that directory; alternatively repeat `--gold FILE --predictions FILE`
+for explicit pairs. This writes `synthesis_evaluation/runs/<run-name>/`
+with `results.json` and `summary.md` (per-dataset, pooled, and macro
+P/R/F1 tables plus pooled per-label recall).
+
 ## License
 
 Maintained by [Tonic AI](https://www.tonic.ai/); license to be confirmed.
