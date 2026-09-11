@@ -55,7 +55,8 @@ import time
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
-from .types import EvalRow, GroundTruthSpan, LABELS, SynthEntity
+from .score_recall import _match_pred
+from .types import EvalRow, LABELS
 
 MODEL = "claude-opus-4-7"
 MAX_TOKENS = 2048
@@ -262,20 +263,8 @@ def _parse_response(text: str) -> Optional[dict]:
     return None
 
 
-def _overlaps(a_s: int, a_e: int, b_s: int, b_e: int) -> bool:
-    return a_s < b_e and b_s < a_e
-
-
-def _match_pred(g: GroundTruthSpan, preds: List[SynthEntity]) -> Optional[SynthEntity]:
-    best = None
-    for p in preds:
-        if p.label != g.label:
-            continue
-        if _overlaps(g.start, g.end, p.start, p.end):
-            ov = min(g.end, p.end) - max(g.start, p.start)
-            if best is None or ov > best[0]:
-                best = (ov, p)
-    return best[1] if best else None
+# The label-matched span matcher lives in score_recall (the single
+# matching rule shared by detection, this judge join, and metrics.py).
 
 
 def _build_mappings(rows: List[EvalRow]) -> Tuple[

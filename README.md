@@ -10,8 +10,10 @@ failures land in exactly one column:
 
 1. **NER recall** — of the gold PII spans, the fraction the synthesizer
    detected (detection only — replacement is scored separately).
-   `detected / gold`. The denominator is always the total gold-span
-   count.
+   `detected / gold`. Detection requires a predicted span that overlaps
+   the gold span *and carries its label* — a span found only under a
+   different label is an NER miss. The denominator is always the total
+   gold-span count.
 2. **Synthesis accuracy** — of the detected gold spans, the fraction
    whose synthetic value is coherent, judged by an LLM against each
    character's PII. `coherent / detected`. An identity mapping
@@ -90,6 +92,54 @@ This writes `synthesis_evaluation/runs/my_run/` with:
 
 To score only detection (no API key, no roster), add `--skip-llm-judge`
 and drop `--characters`.
+
+## NER metrics against the human annotations
+
+The dataset also ships `human_annotations/<set>.jsonl` — an exhaustive
+human annotation of the email and Slack messages of six of the datasets.
+Against that gold, precision and F1 are meaningful (against the
+generated ground truth only recall is), so a second, pure-stdlib
+evaluator scores raw NER predictions per dataset, pooled (micro), and
+macro, under two matching rules: *overlap* (label-matched character
+overlap) and *exact* (identical `start`/`end`/`label`). This is the
+scoring behind the dataset card's "NER engines scored on the human
+gold" table.
+
+Predictions are one JSON line per message: a row id (`row_id`,
+`meta.row_id`, or `meta.cell_id`) plus spans under `entities` or
+`spans`, each with `start`/`end`/`label` (`new_text` is not needed;
+labels outside the five above are ignored).
+
+```bash
+DATA=/path/to/the/downloaded/dataset
+python -m synthesis_evaluation.run_ner_eval \
+  --gold "$DATA/human_annotations/*.jsonl" \
+  --predictions-dir my_ner_output \
+  --run-name my_engine_human_gold
+```
+
+`--predictions-dir` pairs each gold file with the file of the same name
+in that directory; alternatively repeat `--gold FILE --predictions FILE`
+for explicit pairs. This writes `synthesis_evaluation/runs/<run-name>/`
+with `results.json` and `summary.md` (per-dataset, pooled, and macro
+P/R/F1 tables plus pooled per-label recall).
+
+To reproduce the dataset card's Tonic Textual scores, `pip install
+tonic-textual`, set `TONIC_TEXTUAL_API_KEY`, and produce the predictions
+with the bundled runner — it applies the USERNAME allow-list regex the
+published scores used (so Slack mentions like `<@U02CARLOS>` come back
+as single bracket-inclusive spans) and prints the Textual server version
+(the card states which version its scores came from):
+
+```bash
+python -m synthesis_evaluation.run_textual_ner \
+  --input "$DATA/human_annotations/*.jsonl" \
+  --out textual_predictions
+```
+
+then score `textual_predictions` with the `run_ner_eval` command above.
+Scores reproduce to within about a tenth of a point — the Textual
+service is very slightly nondeterministic on borderline detections.
 
 ## License
 

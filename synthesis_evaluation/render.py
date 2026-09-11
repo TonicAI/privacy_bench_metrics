@@ -65,20 +65,22 @@ def render_summary(results: dict) -> str:
         lines.append(f"| {k} | {v} |")
     lines.append("")
     lines.append(
-        "NER recall = detected gold spans / all gold spans. Synthesis "
-        "accuracy = coherently synthesized / detected (an unchanged "
-        "value or an incoherent replacement both count against it; "
-        "spans the judge failed to evaluate stay in the denominator). "
-        "Synthesis + NER accuracy = coherently synthesized / all gold "
-        "spans — the product of the other two.\n")
+        "NER recall = detected gold spans / all gold spans, where "
+        "detection requires a label-matched overlapping prediction. "
+        "Synthesis accuracy = coherently synthesized / detected (an "
+        "unchanged value or an incoherent replacement both count "
+        "against it; spans the judge failed to evaluate stay in the "
+        "denominator). Synthesis + NER accuracy = coherently "
+        "synthesized / all gold spans — the product of the other two.\n")
 
     # NER recall (detection)
     r = detail["recall"]
     lines.append("## NER recall\n")
     lines.append(
         "Detection only: a TP is a ground-truth PII span the "
-        "synthesizer detected (whether the value was actually changed "
-        "is scored under synthesis accuracy below).\n"
+        "synthesizer detected under the right label (whether the value "
+        "was actually changed is scored under synthesis accuracy "
+        "below).\n"
     )
     lines.append("**By entity type:**\n")
     lines.append("| Label | Recall | Detected | Missed | Total |")
