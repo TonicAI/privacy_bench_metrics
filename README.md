@@ -124,6 +124,23 @@ for explicit pairs. This writes `synthesis_evaluation/runs/<run-name>/`
 with `results.json` and `summary.md` (per-dataset, pooled, and macro
 P/R/F1 tables plus pooled per-label recall).
 
+To reproduce the dataset card's Tonic Textual scores, `pip install
+tonic-textual`, set `TONIC_TEXTUAL_API_KEY`, and produce the predictions
+with the bundled runner — it applies the USERNAME allow-list regex the
+published scores used (so Slack mentions like `<@U02CARLOS>` come back
+as single bracket-inclusive spans) and prints the Textual server version
+(the card states which version its scores came from):
+
+```bash
+python -m synthesis_evaluation.run_textual_ner \
+  --input "$DATA/human_annotations/*.jsonl" \
+  --out textual_predictions
+```
+
+then score `textual_predictions` with the `run_ner_eval` command above.
+Scores reproduce to within about a tenth of a point — the Textual
+service is very slightly nondeterministic on borderline detections.
+
 ## License
 
 Maintained by [Tonic AI](https://www.tonic.ai/); license to be confirmed.
