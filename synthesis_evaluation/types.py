@@ -1,18 +1,68 @@
 """Canonical dataclasses used across the synthesis-evaluation suite.
 
-Five entity labels in scope: NAME_GIVEN, NAME_FAMILY, EMAIL_ADDRESS,
-USERNAME, ORGANIZATION. ORGANIZATION spans are grouped by the employer
-organization (`org_group`) rather than by character — org scoring is
-org-group-level and character-independent.
+Ten entity labels in scope: the five original ones (NAME_GIVEN, NAME_FAMILY,
+EMAIL_ADDRESS, USERNAME, ORGANIZATION) plus PHONE_NUMBER, LOCATION_ADDRESS,
+EMPLOYEE_ID, ACCOUNT_NUMBER and URL.
+
+Ownership is decided per span, not per label. A span whose ``characters``
+list is non-empty belongs to those characters; a span carrying ``org_group``
+and no characters belongs to that organization group; ORGANIZATION spans
+always belong to their org group (their ``characters`` list only enumerates
+the members). Everything a character or org group owns — old labels and new —
+is judged together for that owner.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 LABELS: Tuple[str, ...] = (
     "NAME_GIVEN", "NAME_FAMILY", "EMAIL_ADDRESS", "USERNAME", "ORGANIZATION",
+    "PHONE_NUMBER", "LOCATION_ADDRESS", "EMPLOYEE_ID", "ACCOUNT_NUMBER", "URL",
 )
+ORIGINAL_LABELS: Tuple[str, ...] = LABELS[:5]
+# labels a character can own / an org group can own
+PERSON_LABELS: Tuple[str, ...] = tuple(l for l in LABELS if l != "ORGANIZATION")
+ORG_LABELS: Tuple[str, ...] = ("ORGANIZATION", "LOCATION_ADDRESS", "URL", "ACCOUNT_NUMBER", "PHONE_NUMBER")
+
+# Predicted-label vocabularies differ across NER engines for the newer types (Textual says
+# NUMERIC_PII, Presidio says LOCATION or US_BANK_NUMBER ...). A prediction under one of these
+# labels counts as label-matched detection of the gold labels listed. The five original labels
+# stay strict so historical scores are unchanged.
+LABEL_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "PHONE": ("PHONE_NUMBER",), "TELEPHONE": ("PHONE_NUMBER",), "PHONE_NUMBER": ("PHONE_NUMBER",),
+    "LOCATION": ("LOCATION_ADDRESS",), "ADDRESS": ("LOCATION_ADDRESS",), "STREET_ADDRESS": ("LOCATION_ADDRESS",),
+    "LOCATION_ADDRESS": ("LOCATION_ADDRESS",), "GPE": ("LOCATION_ADDRESS",),
+    "URL": ("URL",), "DOMAIN_NAME": ("URL",), "WEBSITE": ("URL",), "LINK": ("URL",),
+    "EMPLOYEE_ID": ("EMPLOYEE_ID",), "ACCOUNT_NUMBER": ("ACCOUNT_NUMBER",),
+    "NUMERIC_PII": ("EMPLOYEE_ID", "ACCOUNT_NUMBER"), "HEALTHCARE_ID": ("EMPLOYEE_ID", "ACCOUNT_NUMBER"),
+    "ID": ("EMPLOYEE_ID", "ACCOUNT_NUMBER"), "ID_NUMBER": ("EMPLOYEE_ID", "ACCOUNT_NUMBER"),
+    "IDENTIFIER": ("EMPLOYEE_ID", "ACCOUNT_NUMBER"), "US_BANK_NUMBER": ("ACCOUNT_NUMBER",),
+    "IBAN_CODE": ("ACCOUNT_NUMBER",), "CREDIT_CARD": ("ACCOUNT_NUMBER",), "BANK_ACCOUNT": ("ACCOUNT_NUMBER",),
+}
+
+
+def labels_match(gold_label: str, pred_label: Optional[str]) -> bool:
+    """Label-matched detection: equal labels, or a predicted label that is an alias of the gold label."""
+    if pred_label is None:
+        return False
+    return pred_label == gold_label or gold_label in LABEL_ALIASES.get(str(pred_label).upper(), ())
+
+
+def in_scope(label: Optional[str]) -> bool:
+    """A predicted label the eval can use: one of ours or an alias of one of ours."""
+    return label is not None and (label in LABELS or str(label).upper() in LABEL_ALIASES)
+
+
+def owner_kind(label: str, characters, org_group: Optional[str]) -> Optional[str]:
+    """'person' | 'org' | None for a gold span."""
+    if label == "ORGANIZATION":
+        return "org" if org_group else None
+    if characters:
+        return "person"
+    if org_group:
+        return "org"
+    return None
 TIER_MINIMAL  = "minimal"
 TIER_ENTITY   = "entity"
 TIER_COMPLETE = "complete"
@@ -39,6 +89,10 @@ class GroundTruthSpan:
     disambiguation_source: Optional[str] = None
     disambiguation_confidence: Optional[str] = None
     org_group: Optional[str] = None
+
+    @property
+    def owner(self) -> Optional[str]:
+        return owner_kind(self.label, self.characters, self.org_group)
 
     @classmethod
     def from_dict(cls, d: dict) -> "GroundTruthSpan":

@@ -6,11 +6,11 @@ import json
 from pathlib import Path
 from typing import Iterable, List
 
-from .types import LABELS
+from .types import LABELS, ORG_LABELS, PERSON_LABELS
 
 # Character-level entity types (ORGANIZATION is scored at the
 # org-group level, not per character).
-CHAR_LABELS = tuple(l for l in LABELS if l != "ORGANIZATION")
+CHAR_LABELS = PERSON_LABELS
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +23,12 @@ def _fmt_pct(x):
     return f"{x*100:.1f}%"
 
 
+def _fmt_prf(block: dict) -> str:
+    return (f"P={_fmt_pct(block.get('precision'))}  "
+            f"R={_fmt_pct(block.get('recall'))}  "
+            f"F1={_fmt_pct(block.get('f1'))}")
+
+
 def render_summary(results: dict) -> str:
     cfg = results["config"]
     metrics = results["metrics"]
@@ -31,9 +37,9 @@ def render_summary(results: dict) -> str:
     lines: List[str] = []
 
     lines.append(f"# Synthesis Evaluation: {cfg['run_name']}\n")
-    lines.append(f"- Predictions: `{cfg.get('predictions')}`")
-    lines.append(f"- Ground truth: `{cfg.get('ground_truth')}`")
-    lines.append(f"- Characters: `{cfg.get('characters')}`")
+    lines.append(f"- Synthesis: `{(cfg.get('synthesis') or cfg.get('predictions'))}`")
+    lines.append(f"- Characters: `{cfg['characters']}`")
+    lines.append(f"- Adapter: `{(cfg.get('adapter') or cfg.get('format') or '-')}`  Tier: `{cfg['tier']}`")
     lines.append(f"- Rows evaluated: {cfg['n_rows']}\n")
 
     # Overall scores at the top
@@ -249,25 +255,116 @@ def render_summary(results: dict) -> str:
             lines.append("**Per-org-group coherent surface buckets** "
                          "(`coherent/judged`; `+k?` = k surfaces without a "
                          "parsable verdict):\n")
-            lines.append("| Org group | Coherent surfaces |")
-            lines.append("|---|---|")
+            lines.append("| Org group | " + " | ".join(ORG_LABELS) + " |")
+            lines.append("|---" * (len(ORG_LABELS) + 1) + "|")
             for grp in sorted(per_org):
                 v = per_org[grp]
                 mapping = v.get("mapping") or {}
+                if mapping and not any(k in ORG_LABELS for k in mapping):
+                    mapping = {"ORGANIZATION": mapping}          # pre-label runs: surfaces only
                 parsed = v.get("parsed") or {}
-                verdicts_by_surface = {}
+                verdicts_by_pair = {}
                 for entry in (parsed.get("verdicts") or []
                               if isinstance(parsed, dict) else []):
                     if isinstance(entry, dict) and isinstance(entry.get("surface"), str):
-                        verdicts_by_surface[entry["surface"]] = \
-                            bool(entry.get("coherent"))
-                judged = [verdicts_by_surface[s] for s in mapping
-                          if s in verdicts_by_surface]
-                n_skip = len(mapping) - len(judged)
-                cell = f"{sum(judged)}/{len(judged)}" if judged else "?"
-                if judged and n_skip:
-                    cell += f" +{n_skip}?"
+                        lab = entry.get("label") if entry.get("label") in ORG_LABELS else "ORGANIZATION"
+                        verdicts_by_pair[(lab, entry["surface"])] = bool(entry.get("coherent"))
+                cells = []
+                for lab in ORG_LABELS:
+                    surfaces = mapping.get(lab) or {}
+                    if not surfaces:
+                        cells.append("—")
+                        continue
+                    judged = [verdicts_by_pair[(lab, s)] for s in surfaces if (lab, s) in verdicts_by_pair]
+                    n_skip = len(surfaces) - len(judged)
+                    cell = f"{sum(judged)}/{len(judged)}" if judged else "?"
+                    if judged and n_skip:
+                        cell += f" +{n_skip}?"
+                    cells.append(cell)
+                cell = " | ".join(cells)
                 lines.append(f"| {grp} | {cell} |")
+            lines.append("")
+
+    # Grouping
+    g = detail["grouping"]
+    lines.append("## Grouping\n")
+    if g.get("skipped"):
+        lines.append(f"_Skipped: {g.get('skipped_reason')}_\n")
+    else:
+        pw = g["pairwise"]
+        b3 = g["b_cubed"]
+        lines.append(f"- Pairwise: {_fmt_prf(pw)}")
+        lines.append(f"- B³: P={_fmt_pct(b3['precision'])}  "
+                     f"R={_fmt_pct(b3['recall'])}  F1={_fmt_pct(b3['f1'])}  "
+                     f"(n={b3['n']})\n")
+
+    # Per-character synthesis mapping — one table per character,
+    # listing every (text, label) bucket and the synthetic values it
+    # mapped to with occurrence counts. Passthrough entries show how
+    # many times the synthesizer left the original surface in the
+    # synthetic output unchanged. The data comes from the consistency
+    # scorer, whose score itself is no longer reported.
+    c = detail["consistency"]
+    pc = c.get("per_character") or {}
+    if pc:
+        lines.append("## Per-character synthesis mapping\n")
+        lines.append(
+            "For each character, every (label, original surface) bucket "
+            "with the synthetic value(s) it mapped to and how many times "
+            "each was emitted. Entries tagged `(passthrough)` are gold "
+            "spans the synthesizer left unchanged in the synthetic text "
+            "(either undetected or detected-but-not-replaced).\n"
+        )
+        for cid in sorted(pc):
+            block = pc[cid]
+            # Build a flat list of (label, orig, [{value, count, ...}]).
+            rows = []
+            for lab in LABELS:
+                blab = block.get(lab) or {}
+                counts_map = blab.get("original_to_synthetic_counts") or {}
+                for orig, items in counts_map.items():
+                    rows.append((lab, orig, items))
+            if not rows:
+                continue
+            lines.append(f"### {cid}\n")
+            lines.append("| Label | Original surface | Synthetic → count |")
+            lines.append("|---|---|---|")
+            for lab, orig, items in rows:
+                cells = ", ".join(
+                    f"`{it['value']}` → {it['count']}"
+                    + (" (passthrough)" if it.get("passthrough") else "")
+                    for it in items
+                )
+                lines.append(f"| {lab} | `{orig}` | {cells} |")
+            lines.append("")
+
+    # Organization synthesis mapping — one table per org group,
+    # character-independent.
+    pog = c.get("per_org_group") or {}
+    if pog:
+        lines.append("## Organization synthesis mapping\n")
+        lines.append(
+            "For each organization group (an employer pulled from the "
+            "characters table), every original surface form referencing "
+            "that organization with the synthetic value(s) it mapped to "
+            "and counts. `(passthrough)` = left unchanged in the "
+            "synthetic text.\n"
+        )
+        for grp in sorted(pog):
+            block = pog[grp]
+            counts_map = block.get("original_to_synthetic_counts") or {}
+            if not counts_map:
+                continue
+            lines.append(f"### {grp}\n")
+            lines.append("| Original surface | Synthetic → count |")
+            lines.append("|---|---|")
+            for orig, items in counts_map.items():
+                cells = ", ".join(
+                    f"`{it['value']}` → {it['count']}"
+                    + (" (passthrough)" if it.get("passthrough") else "")
+                    for it in items
+                )
+                lines.append(f"| `{orig}` | {cells} |")
             lines.append("")
 
     return "\n".join(lines) + "\n"
@@ -337,6 +434,49 @@ def render_viewer(results: dict) -> str:
         _example_rows(metrics.get("identity_examples", []), "row_id"),
     )
 
+    # Consistency offenders
+    cons_rows = []
+    for off in (detail["consistency"].get("inconsistent_buckets") or []):
+        counts = off.get("synthetic_value_counts") or []
+        rendered = ", ".join(f"{c['value']} ({c['count']})" for c in counts[:10])
+        if len(counts) > 10:
+            rendered += f", … +{len(counts) - 10} more"
+        cons_rows.append([
+            _h(off["character"]),
+            _h(off["label"]),
+            _h(off["original"]),
+            _h(off["n_distinct_synthetic"]),
+            _h(rendered),
+        ])
+    cons_tab = _row_table(
+        ["character", "label", "original surface", "#synth", "synthetic values (count)"],
+        cons_rows,
+    )
+
+    # Rule violations: email
+    email_rows = []
+    for v in detail["realism_rule"]["email_violations"]:
+        email_rows.append([
+            _h(v["character"]),
+            _h(v["synthetic_email"]),
+            _h(", ".join(v["synthetic_name_pool"])),
+        ])
+    email_tab = _row_table(["character", "synthetic email", "synthetic name pool"], email_rows)
+
+    # Rule violations: username
+    user_rows = []
+    for v in detail["realism_rule"]["username_violations"]:
+        user_rows.append([
+            _h(v["character"]),
+            _h(v["synthetic_username"]),
+            _h(v["stripped"]),
+            _h(", ".join(v["synthetic_name_pool"])),
+        ])
+    user_tab = _row_table(
+        ["character", "synthetic username", "stripped", "synthetic name pool"],
+        user_rows,
+    )
+
     # LLM incoherent (per character × label × surface). Each synthetic
     # value carries its own verdict (✓/✗) and gold-span count.
     llm_rows = []
@@ -370,9 +510,12 @@ def render_viewer(results: dict) -> str:
     )
 
     tabs = [
-        ("Missed PII (NER FN)",       fn_tab),
-        ("Unchanged PII (identity)",  identity_tab),
-        ("LLM incoherent verdicts",   llm_tab),
+        ("Missed PII (NER FN)",        fn_tab),
+        ("Unchanged PII (identity)",   identity_tab),
+        ("Consistency offenders",      cons_tab),
+        ("Email rule violations",      email_tab),
+        ("Username rule violations",   user_tab),
+        ("LLM incoherent verdicts",    llm_tab),
     ]
 
     nav = "".join(
@@ -412,8 +555,8 @@ ul {{ margin: 0; padding-left: 16px; }}
 <body>
 <h1>Synthesis eval: {_h(cfg['run_name'])}</h1>
 <div class="meta">
-  tier=<code>{_h(cfg.get('tier'))}</code>
-  · rows=<code>{_h(cfg['n_rows'])}</code> · predictions=<code>{_h(cfg.get('predictions'))}</code>
+  adapter=<code>{_h((cfg.get('adapter') or cfg.get('format') or '-'))}</code> · tier=<code>{_h(cfg['tier'])}</code>
+  · rows=<code>{_h(cfg['n_rows'])}</code> · synthesis=<code>{_h((cfg.get('synthesis') or cfg.get('predictions')))}</code>
 </div>
 <nav>{nav}</nav>
 {panels}

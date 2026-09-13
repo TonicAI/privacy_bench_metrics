@@ -18,8 +18,9 @@ Output-file schema (one JSON object per line)::
       ]
     }
 
-``label`` is one of NAME_GIVEN, NAME_FAMILY, EMAIL_ADDRESS, USERNAME,
-ORGANIZATION. ``start``/``end`` are character offsets into the original
+``label`` is one of the ten PrivacyBench labels (NAME_GIVEN, NAME_FAMILY,
+EMAIL_ADDRESS, USERNAME, ORGANIZATION, PHONE_NUMBER, LOCATION_ADDRESS,
+EMPLOYEE_ID, ACCOUNT_NUMBER, URL). ``start``/``end`` are character offsets into the original
 message text (from the ground-truth file). ``text`` is the original PII
 surface and ``new_text`` its synthetic replacement; an entity whose
 ``new_text`` equals its ``text`` counts as detected but not synthesized
@@ -147,11 +148,15 @@ def main() -> int:
                          "synthesis_evaluation/runs/).")
     ap.add_argument("--workers", type=int, default=8,
                     help="Workers for the LLM judge (default 8).")
+    ap.add_argument("--judge-model", default=None,
+                    help=f"LLM judge model id (default {score_realism_llm.MODEL}).")
     ap.add_argument("--skip-llm-judge", action="store_true",
                     help="Skip the LLM-as-judge scorer (offline; NER recall only).")
     ap.add_argument("--limit-rows", type=int, default=None,
                     help="Truncate to N rows (debug only).")
     args = ap.parse_args()
+    if args.judge_model:
+        score_realism_llm.MODEL = args.judge_model   # module-level setting read by every judge call
 
     if not args.predictions.is_file():
         sys.exit(f"missing predictions: {args.predictions}")

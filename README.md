@@ -62,8 +62,7 @@ synthetic replacements, joined to the ground truth by `row_id`:
 ```
 
 `start`/`end` are character offsets into the original message text;
-`label` ∈ {`NAME_GIVEN`, `NAME_FAMILY`, `EMAIL_ADDRESS`, `USERNAME`,
-`ORGANIZATION`}. An entity whose `new_text` equals its `text` counts as
+`label` is one of the ten PrivacyBench labels (see below). An entity whose `new_text` equals its `text` counts as
 detected but not synthesized — it scores as a synthesis miss.
 
 ## Run
@@ -92,6 +91,59 @@ This writes `synthesis_evaluation/runs/my_run/` with:
 
 To score only detection (no API key, no roster), add `--skip-llm-judge`
 and drop `--characters`.
+
+## Scoring a raw-export pipeline (native coordinates)
+
+The published dataset is a file-tree benchmark: `tasks/<set>/` holds raw `.eml`
+files, a Slack export and a Drive listing with PDF/DOCX/XLSX/CSV documents, and
+`ground_truth/<set>/ground_truth.jsonl` locates every gold span in the containing
+file's **native coordinates** (file offsets for `.eml`, JSON pointer + offsets
+for Slack, per-glyph boxes for PDF, XPath fragments for DOCX, cells for XLSX,
+row/column for CSV). A pipeline that works on the raw export reports what it
+detected and replaced in the same shape, one JSON line per file unit:
+
+```json
+{"file": {"kind": "pdf", "path": "email/<id>.eml",
+          "container": {"kind": "eml_attachment", "path": "email/<id>.eml", "part_index": 0}},
+ "spans": [{"label": "NAME_GIVEN", "text": "Megan", "new_text": "Alicia",
+            "location": {"kind": "pdf", "pages": [1], "chars": [["M", 1, 72.0, 96.4, 78.1, 105.4], ...]}}]}
+```
+
+`file` names the export file (and, for a document embedded in an email, the MIME
+part); `location` uses exactly the ground truth's coordinate schema for that kind
+(copy the shape from `ground_truth.jsonl`); `text` is the original string and
+`new_text` the rendered replacement. Score it with:
+
+```bash
+python -m synthesis_evaluation.run_eval_native \
+  --predictions  my_pipeline/aaron_pfizer/predictions.jsonl \
+  --ground-truth $DATA/ground_truth/aaron_pfizer/ground_truth.jsonl \
+  --characters   $DATA/ground_truth/aaron_pfizer/characters.json \
+  --run-name     aaron_pfizer_my_pipeline [--judge-model claude-opus-5] [--skip-llm-judge]
+```
+
+Each gold span is matched to the predicted span of the same file unit that
+overlaps it most in native coordinates (at least half of the union) and carries
+its label; the matched replacement then goes through the same recall, LLM-judge
+and metric code as the message-level evaluator, so the three headline numbers
+keep their definitions. `summary.md` adds a per-file-kind table (eml, slack,
+pdf, docx, xlsx, csv, messages, documents). Every gold span of every file is in
+the denominator whether or not the pipeline emitted that file; the only
+exclusion is the 166 PDF spans the renderer clipped (`location.status ==
+"not_rendered"`). Predictions that overlap no gold span are not scored: the
+gold covers the seed characters and their organizations only, so an unmatched
+prediction is not necessarily wrong. Because the whole export is judged
+together, a pipeline that replaces the same person differently in its emails
+and in its documents is scored as incoherent; consistency across the export is
+part of the task.
+
+All ten labels are in scope (`NAME_GIVEN`, `NAME_FAMILY`, `EMAIL_ADDRESS`,
+`USERNAME`, `ORGANIZATION`, `PHONE_NUMBER`, `LOCATION_ADDRESS`, `EMPLOYEE_ID`,
+`ACCOUNT_NUMBER`, `URL`); the judge groups a character's names, emails,
+handles, phones, addresses and ids and checks they form one coherent synthetic
+identity, and groups each organization's names, addresses, URLs, phones and
+account numbers likewise. The message-level evaluator above (`run_eval`,
+offsets into the row text, joined by `row_id`) accepts the same ten labels.
 
 ## NER metrics against the human annotations
 
