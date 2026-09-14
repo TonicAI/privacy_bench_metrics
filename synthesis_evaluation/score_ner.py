@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Dict, List, Optional
 
-from .types import LABELS
+from .types import LABELS, in_scope, labels_match
 
 
 def _row_id(row: dict) -> str:
@@ -59,7 +59,9 @@ def spans_by_row(rows: List[dict], field: Optional[str] = None) -> Dict[str, Lis
     by default the first of entities / spans / ground_truth_spans is used."""
     out: Dict[str, List[dict]] = {}
     for row in rows:
-        spans = [s for s in _row_spans(row, field) if s["label"] in LABELS]
+        # gold rows carry benchmark labels; prediction rows may use an engine's own vocabulary
+        # (NUMERIC_PII, US_BANK_NUMBER, LOCATION, ...) which types.LABEL_ALIASES maps onto ours
+        spans = [s for s in _row_spans(row, field) if in_scope(s["label"])]
         out[_row_id(row)] = spans
     return out
 
@@ -77,16 +79,16 @@ def score_counts(gold: Dict[str, List[dict]], pred: Dict[str, List[dict]]) -> Co
         c["pred"] += len(p_spans)
         c["detected"] += sum(
             1 for g in g_spans
-            if any(p["label"] == g["label"] and _overlaps(p, g) for p in p_spans))
+            if any(labels_match(g["label"], p["label"]) and _overlaps(p, g) for p in p_spans))
         c["matched"] += sum(
             1 for p in p_spans
-            if any(g["label"] == p["label"] and _overlaps(g, p) for g in g_spans))
-        gset = {(s["start"], s["end"], s["label"]) for s in g_spans}
-        pset = {(s["start"], s["end"], s["label"]) for s in p_spans}
-        c["exact_tp"] += len(gset & pset)
+            if any(labels_match(g["label"], p["label"]) and _overlaps(g, p) for g in g_spans))
+        c["exact_tp"] += sum(
+            1 for g in g_spans
+            if any(labels_match(g["label"], p["label"]) and p["start"] == g["start"] and p["end"] == g["end"] for p in p_spans))
         for g in g_spans:
             c[f"gold_{g['label']}"] += 1
-            if any(p["label"] == g["label"] and _overlaps(p, g) for p in p_spans):
+            if any(labels_match(g["label"], p["label"]) and _overlaps(p, g) for p in p_spans):
                 c[f"detected_{g['label']}"] += 1
     return c
 
