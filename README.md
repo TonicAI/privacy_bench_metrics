@@ -147,20 +147,27 @@ offsets into the row text, joined by `row_id`) accepts the same ten labels.
 
 ## NER metrics against the human annotations
 
-The dataset also ships `human_annotations/<set>.jsonl` — an exhaustive
-human annotation of the email and Slack messages of six of the datasets.
-Against that gold, precision and F1 are meaningful (against the
-generated ground truth only recall is), so a second, pure-stdlib
-evaluator scores raw NER predictions per dataset, pooled (micro), and
-macro, under two matching rules: *overlap* (label-matched character
-overlap) and *exact* (identical `start`/`end`/`label`). This is the
-scoring behind the dataset card's "NER engines scored on the human
-gold" table.
+The dataset also ships exhaustive human NER annotations:
+`human_annotations/<set>.jsonl` — the email and Slack messages of six of
+the datasets (the five original labels) — and
+`human_annotations/<set>_documents.jsonl` — the PDF/DOCX document pages
+of four of them, over all ten labels. Against that gold, precision and
+F1 are meaningful (against the generated ground truth only recall is),
+so a second, pure-stdlib evaluator scores raw NER predictions per
+dataset, pooled (micro), and macro, under two matching rules: *overlap*
+(label-matched character overlap) and *exact* (identical
+`start`/`end`/`label`). This is the scoring behind the dataset card's
+message and document NER tables.
 
-Predictions are one JSON line per message: a row id (`row_id`,
-`meta.row_id`, or `meta.cell_id`) plus spans under `entities` or
-`spans`, each with `start`/`end`/`label` (`new_text` is not needed;
-labels outside the five above are ignored).
+Predictions are one JSON line per message or document page: a row id
+(`row_id`, `meta.row_id`, or `meta.cell_id`; document pages append
+`#p<meta.page>` since a document's pages share its row id — the runner
+below does this for you) plus spans under `entities` or `spans`, each
+with `start`/`end`/`label` (`new_text` is not needed). Labels outside
+the benchmark's ten are ignored, and common engine vocabularies are
+aliased onto them (`LOCATION` → `LOCATION_ADDRESS`, `US_BANK_NUMBER` →
+`ACCOUNT_NUMBER`, `NUMERIC_PII` → the id labels, …) — see
+`LABEL_ALIASES` in `synthesis_evaluation/types.py`.
 
 ```bash
 DATA=/path/to/the/downloaded/dataset
@@ -178,20 +185,40 @@ P/R/F1 tables plus pooled per-label recall).
 
 To reproduce the dataset card's Tonic Textual scores, `pip install
 tonic-textual`, set `TONIC_TEXTUAL_API_KEY`, and produce the predictions
-with the bundled runner — it applies the USERNAME allow-list regex the
+with the bundled runner (it prints the Textual server version — the card
+states which version its scores came from). The card's **message** rows
+use the plain mode, which applies the USERNAME allow-list regex the
 published scores used (so Slack mentions like `<@U02CARLOS>` come back
-as single bracket-inclusive spans) and prints the Textual server version
-(the card states which version its scores came from):
+as single bracket-inclusive spans); document-page files in the glob are
+skipped in this mode:
 
 ```bash
 python -m synthesis_evaluation.run_textual_ner \
   --input "$DATA/human_annotations/*.jsonl" \
-  --out textual_predictions
+  --out textual_msgs
 ```
 
-then score `textual_predictions` with the `run_ner_eval` command above.
-Scores reproduce to within about a tenth of a point — the Textual
-service is very slightly nondeterministic on borderline detections.
+The card's **document** rows ("Textual (SDK, graph config)") add
+`--config` — the graph pipeline's Textual configuration expressed in SDK
+terms (`synthesis_evaluation/textual_config.json`: ACCOUNT_NUMBER and
+LOCATION_ADDRESS allow lists, an EMAIL_ADDRESS block list, username
+regexes server side, employee-id regexes client side). It needs
+`pip install regex` (the config uses variable-width look-behinds):
+
+```bash
+python -m synthesis_evaluation.run_textual_ner \
+  --input "$DATA/human_annotations/*_documents.jsonl" \
+  --config synthesis_evaluation/textual_config.json \
+  --out textual_docs
+```
+
+then score each output folder with the `run_ner_eval` command above
+(`--gold` the same files). Message scores reproduce to within about a
+tenth of a point (the Textual service is very slightly nondeterministic
+on borderline detections); the document scores reproduce the card's
+"Textual (SDK, graph config)" row. Note the config's allow-list regexes
+were derived from the benchmark's generated ground truth — the card
+carries the same caveat.
 
 ## License
 

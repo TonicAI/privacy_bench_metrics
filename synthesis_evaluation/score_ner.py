@@ -3,11 +3,12 @@
 The synthesis evaluation (score_recall.py) reports recall only, because the
 generated ground truth is not an exhaustive listing of every string an NER
 engine might defensibly flag. The human-annotated gold released on the
-dataset under `human_annotations/<set>.jsonl` *is* an exhaustive annotation
-of the five message PII labels, so against it precision and F1 are
-meaningful. This module scores raw NER predictions against that gold; it is
-the scoring used for the dataset card's "NER engines scored on the human
-gold" table.
+dataset *is* an exhaustive annotation — `human_annotations/<set>.jsonl`
+(email + Slack messages, the five original labels) and
+`human_annotations/<set>_documents.jsonl` (PDF/DOCX document pages, all ten
+labels) — so against it precision and F1 are meaningful. This module scores
+raw NER predictions against that gold; it is the scoring behind the dataset
+card's message and document NER tables.
 
 Matching rules
 --------------
@@ -36,13 +37,16 @@ from .types import LABELS, in_scope, labels_match
 
 
 def _row_id(row: dict) -> str:
+    meta = row.get("meta") or {}
     rid = row.get("row_id")
     if rid is None:
-        meta = row.get("meta") or {}
         rid = meta.get("row_id") or meta.get("cell_id")
     if rid is None:
         raise KeyError(f"row has no row_id (top-level, meta.row_id, or meta.cell_id): {list(row)}")
-    return str(rid)
+    # Document-page gold repeats the document's row id across its pages;
+    # meta.page disambiguates (human_annotations/<set>_documents.jsonl).
+    page = row.get("page") if row.get("page") is not None else meta.get("page")
+    return f"{rid}#p{page}" if page is not None else str(rid)
 
 
 def _row_spans(row: dict, field: Optional[str]) -> List[dict]:
