@@ -55,7 +55,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import score_recall, score_realism_llm
+from . import score_consistency, score_grouping, score_realism_llm, score_realism_rule, score_recall
 from .load import load_characters, load_jsonl
 from .metrics import compute_metrics
 from .render import render
@@ -111,8 +111,9 @@ def _build_rows(predictions: Dict[str, List[dict]],
         if rid in predictions:
             matched += 1
         text = gt.get("text") or ""
+        kind = ((gt.get("file") or {}).get("kind") or "").lower()   # present in the published ground_truth.jsonl
         rows.append(EvalRow.from_dict({
-            "meta": gt.get("meta") or {},
+            "meta": {**(gt.get("meta") or {}), **({"kind": "eml" if kind == "email" else kind} if kind else {})},
             "text": text,
             "ground_truth_spans": gt.get("ground_truth_spans") or [],
             "synthesis": {
@@ -204,6 +205,10 @@ def main() -> int:
     print(f"  done in {timings['recall']:.1f}s — overall recall={r_str}  "
           f"tp={recall['overall']['tp']}  fn={recall['overall']['fn']}")
 
+    consistency = score_consistency.score(rows)
+    realism_rule = score_realism_rule.score(rows)
+    grouping = score_grouping.score(rows)
+
     if args.skip_llm_judge:
         print("\nskipping LLM judge (--skip-llm-judge)")
         realism_llm = {
@@ -232,6 +237,10 @@ def main() -> int:
     # synthesis accuracy over all detected gold spans (identity mappings
     # always count as misses), and their product as the combined score.
     metrics = compute_metrics(rows, realism_llm)
+    kinds = [(r.meta or {}).get("kind") or "" for r in rows]
+    if any(kinds):
+        from .run_eval_native import by_kind_metrics
+        metrics["by_kind"] = by_kind_metrics(rows, kinds, realism_llm)   # eml/slack/pdf/... when the gold carries file kinds
     o = metrics["overall"]
 
     def _p(x: Optional[float]) -> str:
@@ -257,8 +266,11 @@ def main() -> int:
         # Supporting evidence: the detection scorer's FN examples and
         # per-character breakdown, and the judge's raw verdicts.
         "detail": {
-            "recall": recall,
-            "judge":  realism_llm,
+            "recall":       recall,
+            "consistency":  consistency,
+            "realism_rule": realism_rule,
+            "judge":        realism_llm,
+            "grouping":     grouping,
         },
     }
 
