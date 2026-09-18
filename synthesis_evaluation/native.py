@@ -62,7 +62,14 @@ def unit_key(kind: str, path: str, container: Optional[dict]) -> Tuple:
 
 
 def iou(a0: float, a1: float, b0: float, b1: float) -> float:
+    """Overlap score for (pred a, gold b) ranges. A prediction that fully CONTAINS the gold span
+    is a correct detection regardless of how much wider it is (NER tags "Nike, Inc." or the
+    compound given name "Tanya Renee" where gold tags the bare "Nike" / "Tanya"); partial overlaps
+    and predictions inside the gold span keep the Jaccard intersection-over-union semantics."""
     inter = max(0.0, min(a1, b1) - max(a0, b0))
+    gold_length = b1 - b0
+    if gold_length > 0 and inter >= gold_length:
+        return 1.0
     union = max(a1, b1) - min(a0, b0)
     return inter / union if union > 0 else 0.0
 
