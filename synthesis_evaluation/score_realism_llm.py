@@ -736,14 +736,39 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         return cid, parsed, None, raw
 
     def process_org(grp: str) -> Tuple[str, Optional[dict], Optional[str], str]:
-        user_msg = _build_org_user_message(grp, org_mappings[grp])
-        try:
-            raw, usage = _call_llm(client, ORG_SYSTEM_PROMPT, user_msg)
-        except Exception as exc:
-            return grp, None, f"{type(exc).__name__}: {exc}", ""
-        parsed = _parse_response(raw)
-        _record(usage, parsed)
-        return grp, parsed, None, raw
+        # A dominant org (a corpus protagonist's employer) can carry more surface buckets than
+        # one MAX_TOKENS response can hold — the verdict JSON truncates mid-list and the whole
+        # group used to count as skipped. Chunk the group's buckets across calls and merge.
+        mapping = org_mappings[grp]
+        flat = [(lab, surf) for lab in mapping for surf in mapping[lab]]
+        chunk_size = 25
+        if len(flat) <= chunk_size:
+            chunks = [mapping]
+        else:
+            chunks = []
+            for start in range(0, len(flat), chunk_size):
+                piece: Dict[str, Dict[str, List[str]]] = {}
+                for lab, surf in flat[start:start + chunk_size]:
+                    piece.setdefault(lab, {})[surf] = mapping[lab][surf]
+                chunks.append(piece)
+        verdicts: List[dict] = []
+        raws: List[str] = []
+        first_error: Optional[str] = None
+        for piece in chunks:
+            user_msg = _build_org_user_message(grp, piece)
+            try:
+                raw, usage = _call_llm(client, ORG_SYSTEM_PROMPT, user_msg)
+            except Exception as exc:
+                first_error = first_error or f"{type(exc).__name__}: {exc}"
+                continue
+            parsed = _parse_response(raw)
+            _record(usage, parsed)
+            raws.append(raw)
+            if parsed and isinstance(parsed.get("verdicts"), list):
+                verdicts.extend(parsed["verdicts"])
+        if not verdicts:
+            return grp, None, first_error or "no chunk parsed", "\n".join(raws)
+        return grp, {"verdicts": verdicts}, None, "\n".join(raws)
 
     def process_unowned(i: int) -> Tuple[str, Optional[dict], Optional[str], str]:
         user_msg = _build_unowned_user_message(unowned_batches[i])
