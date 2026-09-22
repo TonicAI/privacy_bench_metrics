@@ -151,7 +151,7 @@ The dataset also ships exhaustive human NER annotations:
 `human_annotations/<set>.jsonl` — the email and Slack messages of six of
 the datasets (the five original labels) — and
 `human_annotations/<set>_documents.jsonl` — the PDF/DOCX document pages
-of four of them, over all ten labels. Against that gold, precision and
+of the same six datasets, over all ten labels. Against that gold, precision and
 F1 are meaningful (against the generated ground truth only recall is),
 so a second, pure-stdlib evaluator scores raw NER predictions per
 dataset, pooled (micro), and macro, under two matching rules: *overlap*
@@ -184,41 +184,89 @@ with `results.json` and `summary.md` (per-dataset, pooled, and macro
 P/R/F1 tables plus pooled per-label recall).
 
 To reproduce the dataset card's Tonic Textual scores, `pip install
-tonic-textual`, set `TONIC_TEXTUAL_API_KEY`, and produce the predictions
+tonic-textual regex`, set `TONIC_TEXTUAL_API_KEY`, and produce the predictions
 with the bundled runner (it prints the Textual server version — the card
-states which version its scores came from). The card's **message** rows
-use the plain mode, which applies the USERNAME allow-list regex the
-published scores used (so Slack mentions like `<@U02CARLOS>` come back
-as single bracket-inclusive spans); document-page files in the glob are
-skipped in this mode:
+states which version its scores came from). The card's **Textual via SDK**
+rows, messages and document pages alike, apply the graph pipeline's Textual
+configuration expressed in SDK terms (`synthesis_evaluation/textual_config.json`):
+allow lists for ACCOUNT_NUMBER, LOCATION_ADDRESS and ORGANIZATION and the
+username regexes forced server side, an EMAIL_ADDRESS block list, and the
+employee-id regexes applied client side. The ORGANIZATION allow list is the
+graph config's, restricted to the entries whose comment names one of the six
+human-annotated datasets (Coronado and Trimble Fleet Telematics API for
+`nora_caterpillar`, Walmart and Fresh & Value-Added Poultry for
+`renee_tyson_foods`); the config carries two more for datasets without human
+annotations, which never match their text. Message files are filtered to the
+five original labels automatically; page files keep all ten:
 
 ```bash
 python -m synthesis_evaluation.run_textual_ner \
   --input "$DATA/human_annotations/*.jsonl" \
-  --out textual_msgs
+  --config synthesis_evaluation/textual_config.json \
+  --out textual_predictions
+python -m synthesis_evaluation.run_ner_eval \
+  --gold "$DATA/human_annotations/*.jsonl" \
+  --predictions-dir textual_predictions \
+  --run-name textual_human_gold
 ```
 
-The card's **document** rows ("Textual (SDK, graph config)") add
-`--config` — the graph pipeline's Textual configuration expressed in SDK
-terms (`synthesis_evaluation/textual_config.json`: ACCOUNT_NUMBER and
-LOCATION_ADDRESS allow lists, an EMAIL_ADDRESS block list, username
-regexes server side, employee-id regexes client side). It needs
-`pip install regex` (the config uses variable-width look-behinds):
+Without `--config` the runner falls back to the plain mode of the earlier
+message-only scores (built-in labels plus the USERNAME allow-list regex, so
+Slack mentions like `<@U02CARLOS>` come back as single bracket-inclusive
+spans); document-page files in the glob are skipped in that mode. Scores
+reproduce to within about a tenth of a point (the Textual service is very
+slightly nondeterministic on borderline detections). Note the config's
+allow-list regexes were derived from the benchmark's generated ground
+truth and, for organizations, from the human gold itself — the card
+carries the same caveat.
+
+### Reproducing the Presidio and GLiNER2 rows
+
+The card's two open-source baselines run through
+`synthesis_evaluation/run_baseline_ner.py`, which reads the same
+human-annotation files and writes `run_ner_eval` prediction files (one
+per input file, page rows keyed `<row_id>#p<page>`). Message files are
+scored on the five original labels, so the engines are asked only for
+person / organization / email / username there; document pages carry all
+ten labels, so phone numbers, addresses, ids and URLs are requested as
+well. Engine labels outside the benchmark vocabulary (Presidio's
+`LOCATION`, `US_BANK_NUMBER`, `ID_NUMBER`, …) are written as-is and folded
+onto the benchmark labels by `LABEL_ALIASES` at scoring time. Person spans
+are split into a first-token NAME_GIVEN and a last-token NAME_FAMILY, as
+the benchmark's other NER pipelines do.
+
+**Presidio** — spaCy `en_core_web_trf` through presidio's NLP engine
+(ORG kept at spaCy's score instead of presidio's down-weighting),
+presidio's built-in recognisers, a USERNAME pattern for Slack mentions
+and `@handles`, and on pages a generic `[A-Z]{2,5}-\d{4,9}` id pattern
+emitted as `ID_NUMBER`; minimum score 0.5 (phones keep presidio's 0.4):
 
 ```bash
-python -m synthesis_evaluation.run_textual_ner \
-  --input "$DATA/human_annotations/*_documents.jsonl" \
-  --config synthesis_evaluation/textual_config.json \
-  --out textual_docs
+pip install presidio-analyzer spacy && python -m spacy download en_core_web_trf
+python -m synthesis_evaluation.run_baseline_ner --engine presidio \
+  --input "$DATA/human_annotations/*.jsonl" --out presidio_predictions
+python -m synthesis_evaluation.run_ner_eval --gold "$DATA/human_annotations/*.jsonl" \
+  --predictions-dir presidio_predictions --run-name presidio_human_gold
 ```
 
-then score each output folder with the `run_ner_eval` command above
-(`--gold` the same files). Message scores reproduce to within about a
-tenth of a point (the Textual service is very slightly nondeterministic
-on borderline detections); the document scores reproduce the card's
-"Textual (SDK, graph config)" row. Note the config's allow-list regexes
-were derived from the benchmark's generated ground truth — the card
-carries the same caveat.
+**GLiNER2** — `fastino/gliner2-privacy-filter-PII-multi`, schema-conditioned
+with the benchmark's label descriptions, threshold 0.3, texts windowed at
+350 words with 50 words of overlap. `gliner2` needs a newer `transformers`
+than `spacy-transformers` accepts, so give it its own virtualenv:
+
+```bash
+pip install gliner2
+python -m synthesis_evaluation.run_baseline_ner --engine gliner \
+  --input "$DATA/human_annotations/*.jsonl" --out gliner_predictions
+python -m synthesis_evaluation.run_ner_eval --gold "$DATA/human_annotations/*.jsonl" \
+  --predictions-dir gliner_predictions --run-name gliner_human_gold
+```
+
+Both engines are deterministic on CPU; the pooled rows of the two
+`summary.md` files are the card's Presidio and GLiNER2 rows. The model
+checkpoint, threshold and spaCy model are flags (`--gliner-model`,
+`--threshold`, `--spacy-model`, `--min-score`) and are recorded in
+`run_metadata.json` next to the predictions.
 
 ## License
 

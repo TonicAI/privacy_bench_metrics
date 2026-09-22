@@ -52,13 +52,28 @@
   },
   "LOCATION_ADDRESS": {
    "regexes": [
-    "(?:(?<![\\d\\-/:.#$,])\\b\\d{1,6}[A-Za-z]?(?:-\\d{1,5})?\\s+(?:(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?\\s+)?(?:(?:[A-Z]\\.|[A-Z][\\w'\u2019-]*|\\d{1,3}(?:st|nd|rd|th))\\s+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Parkway|Pkwy|Plaza|Plz|Court|Ct|Place|Pl|Circle|Cir|Highway|Hwy|Terrace|Ter|Trail|Trl|Square|Sq|Broadway|Pike|Turnpike|Tpke|Route|Rte|Expressway|Expy|Freeway|Fwy|Alley|Loop)\\b\\.?(?:\\s+\\d{1,4}(?![\\d-]))?(?:\\s+(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?(?=[,\\s]))?|\\bP\\.?\\s?O\\.?\\s+Box\\s+\\d+)(?:,?\\s+(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?))*"
+    "(?:(?<![\\d\\-/:.#$,])\\b\\d{1,6}[A-Za-z]?(?:-\\d{1,5})?\\s+(?:(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?\\s+)?(?:(?:[A-Z]\\.|[A-Z][\\w'’-]*|\\d{1,3}(?:st|nd|rd|th))\\s+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Parkway|Pkwy|Plaza|Plz|Court|Ct|Place|Pl|Circle|Cir|Highway|Hwy|Terrace|Ter|Trail|Trl|Square|Sq|Broadway|Pike|Turnpike|Tpke|Route|Rte|Expressway|Expy|Freeway|Fwy|Alley|Loop)\\b\\.?(?:\\s+\\d{1,4}(?![\\d-]))?(?:\\s+(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?(?=[,\\s]))?|\\bP\\.?\\s?O\\.?\\s+Box\\s+\\d+)(?:,?\\s+(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?))*"
    ]
   },
   "LOCATION_COMPLETE_ADDRESS": {
    "regexes": [
-    "(?:(?<![\\d\\-/:.#$,])\\b\\d{1,6}[A-Za-z]?(?:-\\d{1,5})?\\s+(?:(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?\\s+)?(?:(?:[A-Z]\\.|[A-Z][\\w'\u2019-]*|\\d{1,3}(?:st|nd|rd|th))\\s+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Parkway|Pkwy|Plaza|Plz|Court|Ct|Place|Pl|Circle|Cir|Highway|Hwy|Terrace|Ter|Trail|Trl|Square|Sq|Broadway|Pike|Turnpike|Tpke|Route|Rte|Expressway|Expy|Freeway|Fwy|Alley|Loop)\\b\\.?(?:\\s+\\d{1,4}(?![\\d-]))?(?:\\s+(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?(?=[,\\s]))?|\\bP\\.?\\s?O\\.?\\s+Box\\s+\\d+)(?:,?\\s+(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?))*(?:,?(?:[ \\t]*\\n[ \\t]*|[ \\t]+)(?:(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?),?[ \\t]*\\n[ \\t]*)?[A-Z][A-Za-z.'\u2019-]+(?:\\s[A-Z][A-Za-z.'\u2019-]+){0,3},?\\s+(?:[A-Z]{2}|Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming|D\\.?C\\.?)\\s+\\d{5}(?:-\\d{4})?)"
+    "(?:(?<![\\d\\-/:.#$,])\\b\\d{1,6}[A-Za-z]?(?:-\\d{1,5})?\\s+(?:(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?\\s+)?(?:(?:[A-Z]\\.|[A-Z][\\w'’-]*|\\d{1,3}(?:st|nd|rd|th))\\s+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Parkway|Pkwy|Plaza|Plz|Court|Ct|Place|Pl|Circle|Cir|Highway|Hwy|Terrace|Ter|Trail|Trl|Square|Sq|Broadway|Pike|Turnpike|Tpke|Route|Rte|Expressway|Expy|Freeway|Fwy|Alley|Loop)\\b\\.?(?:\\s+\\d{1,4}(?![\\d-]))?(?:\\s+(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?(?=[,\\s]))?|\\bP\\.?\\s?O\\.?\\s+Box\\s+\\d+)(?:,?\\s+(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?))*(?:,?(?:[ \\t]*\\n[ \\t]*|[ \\t]+)(?:(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?),?[ \\t]*\\n[ \\t]*)?[A-Z][A-Za-z.'’-]+(?:\\s[A-Z][A-Za-z.'’-]+){0,3},?\\s+(?:[A-Z]{2}|Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming|D\\.?C\\.?)\\s+\\d{5}(?:-\\d{4})?)"
    ]
+  },
+  "ORGANIZATION": {
+   "regexes": [
+    "\\bWalmart\\b",
+    "\\bTrimble Fleet Telematics API\\b",
+    "\\bCoronado\\b",
+    "\\bFresh & Value-Added Poultry\\b"
+   ],
+   "comments": {
+    "\\bWalmart\\b": "yusuf_procter_gamble + renee_tyson_foods — retailer mentions (NOTE: renee's are mostly in unprojected csv prose columns, where allow lists cannot fire)",
+    "\\bTrimble Fleet Telematics API\\b": "nora_caterpillar — vendor/product-as-org in dense PDFs (132 gold spans)",
+    "\\bCoronado\\b": "nora_caterpillar — internal program/site name as org (361 gold spans)",
+    "\\bFresh & Value-Added Poultry\\b": "renee_tyson_foods — business-unit name as org (104 gold spans)"
+   },
+   "note": "Restricted to the entries whose comment names a human-annotated dataset (nora_caterpillar, renee_tyson_foods); the graph config also carries regexes for malik_spotify (Artist Relations) and elena_stripe (stripe), which never match text in the annotated sets."
   }
  },
  "block_lists": {
@@ -69,5 +84,6 @@
     "(?i)\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@[A-Za-z0-9.-]+\\b"
    ]
   }
- }
+ },
+ "ignored_companies": []
 }

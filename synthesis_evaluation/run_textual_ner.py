@@ -101,9 +101,9 @@ class TextualRunner:
             self.employee_id = []
         else:
             import regex              # variable-width look-behinds in the config
-            self.allow = {"USERNAME": config["custom_entities"]["username"]["regexes"],
-                          "ACCOUNT_NUMBER": config["allow_lists"]["ACCOUNT_NUMBER"]["regexes"],
-                          "LOCATION_ADDRESS": config["allow_lists"]["LOCATION_ADDRESS"]["regexes"]}
+            self.allow = {"USERNAME": config["custom_entities"]["username"]["regexes"]}
+            # every allow list in the config (ACCOUNT_NUMBER, LOCATION_ADDRESS, ORGANIZATION, ...), forced server side
+            self.allow.update({label: v["regexes"] for label, v in config["allow_lists"].items() if v.get("regexes")})
             self.block = {"EMAIL_ADDRESS": config["block_lists"]["EMAIL_ADDRESS"]["regexes"]}
             self.keep = (set(config["synthesize_labels"]) - {"PERSON"}
                          | {"EMPLOYEE_ID", "ACCOUNT_NUMBER", "LOCATION_ADDRESS", "USERNAME"})
