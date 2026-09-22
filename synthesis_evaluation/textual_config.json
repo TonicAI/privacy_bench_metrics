@@ -66,14 +66,7 @@
     "\\bTrimble Fleet Telematics API\\b",
     "\\bCoronado\\b",
     "\\bFresh & Value-Added Poultry\\b"
-   ],
-   "comments": {
-    "\\bWalmart\\b": "yusuf_procter_gamble + renee_tyson_foods — retailer mentions (NOTE: renee's are mostly in unprojected csv prose columns, where allow lists cannot fire)",
-    "\\bTrimble Fleet Telematics API\\b": "nora_caterpillar — vendor/product-as-org in dense PDFs (132 gold spans)",
-    "\\bCoronado\\b": "nora_caterpillar — internal program/site name as org (361 gold spans)",
-    "\\bFresh & Value-Added Poultry\\b": "renee_tyson_foods — business-unit name as org (104 gold spans)"
-   },
-   "note": "Restricted to the entries whose comment names a human-annotated dataset (nora_caterpillar, renee_tyson_foods); the graph config also carries regexes for malik_spotify (Artist Relations) and elena_stripe (stripe), which never match text in the annotated sets."
+   ]
   }
  },
  "block_lists": {
