@@ -1,0 +1,82 @@
+{
+ "synthesize_labels": [
+  "ACCOUNT_NUMBER",
+  "EMAIL_ADDRESS",
+  "LOCATION_ADDRESS",
+  "LOCATION_COMPLETE_ADDRESS",
+  "NAME_GIVEN",
+  "NAME_FAMILY",
+  "PERSON",
+  "NUMERIC_PII",
+  "ORGANIZATION",
+  "PASSWORD",
+  "PHONE_NUMBER",
+  "URL",
+  "US_BANK_NUMBER",
+  "USERNAME"
+ ],
+ "custom_entities": {
+  "username": {
+   "regexes": [
+    "(?<=<@)[^>]+(?=>)",
+    "(?<![A-Za-z0-9._%+\\-@])@(?!(?:type|context|id|graph|schema|param|return|see|code|media|import|charset|here|channel|everyone|all|INR|USD|EUR)\\b)[A-Za-z][A-Za-z0-9._\\-]{2,30}\\b",
+    "\\bU0[23][A-Z][A-Z0-9_]+\\b",
+    "(?i)(?<=linkedin(?:\\.com/in/|:\\s{1,3}|\\s+profile\\s{1,3}))[a-z][a-z0-9]*(?:-[a-z0-9]+){1,4}\\b",
+    "(?<![\\w.@-])[a-z]{2,}\\.(?!(?:com|net|org|io|ai|co|edu|gov|xyz|us|uk|kr|jp|cn|in|au|de|fr|ca|br|it|nl|se|es|md|jpg|jpeg|png|gif|pdf|docx?|xlsx?|pptx?|json|yaml|yml|py|js|ts|html|htm|csv|txt|eml|zip)\\b)[a-z]{2,}\\b(?![.@-])"
+   ]
+  },
+  "employee_id": {
+   "regexes": [
+    "\\b(?:CAT|CMG|KR|LFG|LLY|NFX|NK|PFE|PG|RJF|SCH|SPOT|STR|WF|WI)-(?!(?:19|20)\\d{2}\\b)\\d{4,8}\\b(?!-?\\d)",
+    "\\b(?:[A-Z]{1,4}-)?EMP-\\d{3,7}\\b",
+    "\\b(?:MS-CLT|SPT-NA)-\\d{4,6}\\b",
+    "\\bJD\\d{6}\\b",
+    "(?i)(?<=\\b(?:employee|badge|associate|personnel|rep|license|patient)[\\s_]*(?:id\\b|no\\.?|number\\b|#)[\\s:#]*)(?=[A-Za-z-]{0,12}\\d)[A-Z0-9][A-Z0-9-]{3,14}\\b"
+   ]
+  }
+ },
+ "allow_lists": {
+  "ACCOUNT_NUMBER": {
+   "regexes": [
+    "\\bACCT?-?\\d{6,7}\\b",
+    "\\bACCT-[A-Z]{2,4}-\\d{4,8}\\b",
+    "\\b(?:CB|KFO|YLH)-(?!(?:19|20)\\d{2}\\b)\\d{4,7}\\b",
+    "\\b(?:DEN|GL|LTD|STD)-\\d{7}-CT\\b",
+    "\\b(?:FLA-ORG|LFG-GRP)-\\d{5,7}\\b",
+    "\\bGSH-\\d{4}-\\d{5}\\b",
+    "(?<![\\d*-])(?!(?:19|20)\\d{2}-)\\d{4}-\\d{4,5}(?![\\d-])",
+    "\\b\\d{3,4}-\\d{5,7}-\\d{2,3}\\b(?!-?\\d)",
+    "(?<![\\d*])\\*{2,4}(?:-\\*{2,4})*-?\\d{4}\\b",
+    "(?i)(?<=\\b(?:customer|member|account|acct|policy|loan)[\\s_]*(?:id\\b|no\\.?|number\\b|#)?[\\s:#]*)[A-Z]{1,5}-\\d{5,10}\\b"
+   ]
+  },
+  "LOCATION_ADDRESS": {
+   "regexes": [
+    "(?:(?<![\\d\\-/:.#$,])\\b\\d{1,6}[A-Za-z]?(?:-\\d{1,5})?\\s+(?:(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?\\s+)?(?:(?:[A-Z]\\.|[A-Z][\\w'’-]*|\\d{1,3}(?:st|nd|rd|th))\\s+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Parkway|Pkwy|Plaza|Plz|Court|Ct|Place|Pl|Circle|Cir|Highway|Hwy|Terrace|Ter|Trail|Trl|Square|Sq|Broadway|Pike|Turnpike|Tpke|Route|Rte|Expressway|Expy|Freeway|Fwy|Alley|Loop)\\b\\.?(?:\\s+\\d{1,4}(?![\\d-]))?(?:\\s+(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?(?=[,\\s]))?|\\bP\\.?\\s?O\\.?\\s+Box\\s+\\d+)(?:,?\\s+(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?))*"
+   ]
+  },
+  "LOCATION_COMPLETE_ADDRESS": {
+   "regexes": [
+    "(?:(?<![\\d\\-/:.#$,])\\b\\d{1,6}[A-Za-z]?(?:-\\d{1,5})?\\s+(?:(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?\\s+)?(?:(?:[A-Z]\\.|[A-Z][\\w'’-]*|\\d{1,3}(?:st|nd|rd|th))\\s+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Parkway|Pkwy|Plaza|Plz|Court|Ct|Place|Pl|Circle|Cir|Highway|Hwy|Terrace|Ter|Trail|Trl|Square|Sq|Broadway|Pike|Turnpike|Tpke|Route|Rte|Expressway|Expy|Freeway|Fwy|Alley|Loop)\\b\\.?(?:\\s+\\d{1,4}(?![\\d-]))?(?:\\s+(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\\.?(?=[,\\s]))?|\\bP\\.?\\s?O\\.?\\s+Box\\s+\\d+)(?:,?\\s+(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?))*(?:,?(?:[ \\t]*\\n[ \\t]*|[ \\t]+)(?:(?:(?:(?:Suite|Ste|Unit|Apt|Apartment|Floor|Fl|Bldg|Building|Room|Rm|Mail\\s?Stop|MS)\\b\\.?|#)\\s*[\\w-]+|\\d{1,3}(?:st|nd|rd|th)\\s+(?:Floor|Fl)\\b\\.?),?[ \\t]*\\n[ \\t]*)?[A-Z][A-Za-z.'’-]+(?:\\s[A-Z][A-Za-z.'’-]+){0,3},?\\s+(?:[A-Z]{2}|Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming|D\\.?C\\.?)\\s+\\d{5}(?:-\\d{4})?)"
+   ]
+  },
+  "ORGANIZATION": {
+   "regexes": [
+    "\\bWalmart\\b",
+    "\\bTrimble Fleet Telematics API\\b",
+    "\\bCoronado\\b",
+    "\\bFresh & Value-Added Poultry\\b"
+   ]
+  }
+ },
+ "block_lists": {
+  "EMAIL_ADDRESS": {
+   "regexes": [
+    "(?i)\\bimage\\d+\\.(png|jpe?g|gif|bmp)@[A-Z0-9.]+\\b",
+    "(?i)\\b[\\w.%+-]+@[\\w-]+\\b(?!\\.[A-Za-z])",
+    "(?i)\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@[A-Za-z0-9.-]+\\b"
+   ]
+  }
+ },
+ "ignored_companies": []
+}

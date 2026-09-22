@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional
 
-from .types import EvalRow, LABELS, GroundTruthSpan, SynthEntity
+from .types import EvalRow, LABELS, GroundTruthSpan, SynthEntity, labels_match
 
 TOP_K_FN = 100
 
@@ -41,7 +41,7 @@ def _match_pred(g: GroundTruthSpan, preds: List[SynthEntity]) -> Optional[SynthE
     overlap onto `g`; None when no same-label prediction overlaps."""
     best = None
     for p in preds:
-        if p.label != g.label:
+        if not labels_match(g.label, p.label):
             continue
         if _overlaps(g.start, g.end, p.start, p.end):
             ov = min(g.end, p.end) - max(g.start, p.start)

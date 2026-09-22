@@ -3,11 +3,12 @@
 The synthesis evaluation (score_recall.py) reports recall only, because the
 generated ground truth is not an exhaustive listing of every string an NER
 engine might defensibly flag. The human-annotated gold released on the
-dataset under `human_annotations/<set>.jsonl` *is* an exhaustive annotation
-of the five message PII labels, so against it precision and F1 are
-meaningful. This module scores raw NER predictions against that gold; it is
-the scoring used for the dataset card's "NER engines scored on the human
-gold" table.
+dataset *is* an exhaustive annotation — `human_annotations/<set>.jsonl`
+(email + Slack messages, the five original labels) and
+`human_annotations/<set>_documents.jsonl` (PDF/DOCX document pages, all ten
+labels) — so against it precision and F1 are meaningful. This module scores
+raw NER predictions against that gold; it is the scoring behind the dataset
+card's message and document NER tables.
 
 Matching rules
 --------------
@@ -32,17 +33,20 @@ from __future__ import annotations
 from collections import Counter
 from typing import Dict, List, Optional
 
-from .types import LABELS
+from .types import LABELS, in_scope, labels_match
 
 
 def _row_id(row: dict) -> str:
+    meta = row.get("meta") or {}
     rid = row.get("row_id")
     if rid is None:
-        meta = row.get("meta") or {}
         rid = meta.get("row_id") or meta.get("cell_id")
     if rid is None:
         raise KeyError(f"row has no row_id (top-level, meta.row_id, or meta.cell_id): {list(row)}")
-    return str(rid)
+    # Document-page gold repeats the document's row id across its pages;
+    # meta.page disambiguates (human_annotations/<set>_documents.jsonl).
+    page = row.get("page") if row.get("page") is not None else meta.get("page")
+    return f"{rid}#p{page}" if page is not None else str(rid)
 
 
 def _row_spans(row: dict, field: Optional[str]) -> List[dict]:
@@ -59,7 +63,9 @@ def spans_by_row(rows: List[dict], field: Optional[str] = None) -> Dict[str, Lis
     by default the first of entities / spans / ground_truth_spans is used."""
     out: Dict[str, List[dict]] = {}
     for row in rows:
-        spans = [s for s in _row_spans(row, field) if s["label"] in LABELS]
+        # gold rows carry benchmark labels; prediction rows may use an engine's own vocabulary
+        # (NUMERIC_PII, US_BANK_NUMBER, LOCATION, ...) which types.LABEL_ALIASES maps onto ours
+        spans = [s for s in _row_spans(row, field) if in_scope(s["label"])]
         out[_row_id(row)] = spans
     return out
 
@@ -77,16 +83,16 @@ def score_counts(gold: Dict[str, List[dict]], pred: Dict[str, List[dict]]) -> Co
         c["pred"] += len(p_spans)
         c["detected"] += sum(
             1 for g in g_spans
-            if any(p["label"] == g["label"] and _overlaps(p, g) for p in p_spans))
+            if any(labels_match(g["label"], p["label"]) and _overlaps(p, g) for p in p_spans))
         c["matched"] += sum(
             1 for p in p_spans
-            if any(g["label"] == p["label"] and _overlaps(g, p) for g in g_spans))
-        gset = {(s["start"], s["end"], s["label"]) for s in g_spans}
-        pset = {(s["start"], s["end"], s["label"]) for s in p_spans}
-        c["exact_tp"] += len(gset & pset)
+            if any(labels_match(g["label"], p["label"]) and _overlaps(g, p) for g in g_spans))
+        c["exact_tp"] += sum(
+            1 for g in g_spans
+            if any(labels_match(g["label"], p["label"]) and p["start"] == g["start"] and p["end"] == g["end"] for p in p_spans))
         for g in g_spans:
             c[f"gold_{g['label']}"] += 1
-            if any(p["label"] == g["label"] and _overlaps(p, g) for p in p_spans):
+            if any(labels_match(g["label"], p["label"]) and _overlaps(p, g) for p in p_spans):
                 c[f"detected_{g['label']}"] += 1
     return c
 

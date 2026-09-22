@@ -18,8 +18,9 @@ Output-file schema (one JSON object per line)::
       ]
     }
 
-``label`` is one of NAME_GIVEN, NAME_FAMILY, EMAIL_ADDRESS, USERNAME,
-ORGANIZATION. ``start``/``end`` are character offsets into the original
+``label`` is one of the ten PrivacyBench labels (NAME_GIVEN, NAME_FAMILY,
+EMAIL_ADDRESS, USERNAME, ORGANIZATION, PHONE_NUMBER, LOCATION_ADDRESS,
+EMPLOYEE_ID, ACCOUNT_NUMBER, URL). ``start``/``end`` are character offsets into the original
 message text (from the ground-truth file). ``text`` is the original PII
 surface and ``new_text`` its synthetic replacement; an entity whose
 ``new_text`` equals its ``text`` counts as detected but not synthesized
@@ -54,7 +55,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import score_recall, score_realism_llm
+from . import score_consistency, score_grouping, score_realism_llm, score_realism_rule, score_recall
 from .load import load_characters, load_jsonl
 from .metrics import compute_metrics
 from .render import render
@@ -110,8 +111,9 @@ def _build_rows(predictions: Dict[str, List[dict]],
         if rid in predictions:
             matched += 1
         text = gt.get("text") or ""
+        kind = ((gt.get("file") or {}).get("kind") or "").lower()   # present in the published ground_truth.jsonl
         rows.append(EvalRow.from_dict({
-            "meta": gt.get("meta") or {},
+            "meta": {**(gt.get("meta") or {}), **({"kind": "eml" if kind == "email" else kind} if kind else {})},
             "text": text,
             "ground_truth_spans": gt.get("ground_truth_spans") or [],
             "synthesis": {
@@ -147,11 +149,15 @@ def main() -> int:
                          "synthesis_evaluation/runs/).")
     ap.add_argument("--workers", type=int, default=8,
                     help="Workers for the LLM judge (default 8).")
+    ap.add_argument("--judge-model", default=None,
+                    help=f"LLM judge model id (default {score_realism_llm.MODEL}).")
     ap.add_argument("--skip-llm-judge", action="store_true",
                     help="Skip the LLM-as-judge scorer (offline; NER recall only).")
     ap.add_argument("--limit-rows", type=int, default=None,
                     help="Truncate to N rows (debug only).")
     args = ap.parse_args()
+    if args.judge_model:
+        score_realism_llm.MODEL = args.judge_model   # module-level setting read by every judge call
 
     if not args.predictions.is_file():
         sys.exit(f"missing predictions: {args.predictions}")
@@ -199,6 +205,10 @@ def main() -> int:
     print(f"  done in {timings['recall']:.1f}s — overall recall={r_str}  "
           f"tp={recall['overall']['tp']}  fn={recall['overall']['fn']}")
 
+    consistency = score_consistency.score(rows)
+    realism_rule = score_realism_rule.score(rows)
+    grouping = score_grouping.score(rows)
+
     if args.skip_llm_judge:
         print("\nskipping LLM judge (--skip-llm-judge)")
         realism_llm = {
@@ -227,6 +237,10 @@ def main() -> int:
     # synthesis accuracy over all detected gold spans (identity mappings
     # always count as misses), and their product as the combined score.
     metrics = compute_metrics(rows, realism_llm)
+    kinds = [(r.meta or {}).get("kind") or "" for r in rows]
+    if any(kinds):
+        from .run_eval_native import by_kind_metrics
+        metrics["by_kind"] = by_kind_metrics(rows, kinds, realism_llm)   # eml/slack/pdf/... when the gold carries file kinds
     o = metrics["overall"]
 
     def _p(x: Optional[float]) -> str:
@@ -252,8 +266,11 @@ def main() -> int:
         # Supporting evidence: the detection scorer's FN examples and
         # per-character breakdown, and the judge's raw verdicts.
         "detail": {
-            "recall": recall,
-            "judge":  realism_llm,
+            "recall":       recall,
+            "consistency":  consistency,
+            "realism_rule": realism_rule,
+            "judge":        realism_llm,
+            "grouping":     grouping,
         },
     }
 
