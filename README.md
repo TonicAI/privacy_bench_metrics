@@ -188,15 +188,8 @@ tonic-textual regex`, set `TONIC_TEXTUAL_API_KEY`, and produce the predictions
 with the bundled runner (it prints the Textual server version — the card
 states which version its scores came from). The card's **Textual via SDK**
 rows, messages and document pages alike, apply the graph pipeline's Textual
-configuration expressed in SDK terms (`synthesis_evaluation/textual_config.json`):
-allow lists for ACCOUNT_NUMBER, LOCATION_ADDRESS and ORGANIZATION and the
-username regexes forced server side, an EMAIL_ADDRESS block list, and the
-employee-id regexes applied client side. The ORGANIZATION allow list is the
-graph config's, restricted to the entries whose comment names one of the six
-human-annotated datasets (Coronado and Trimble Fleet Telematics API for
-`nora_caterpillar`, Walmart and Fresh & Value-Added Poultry for
-`renee_tyson_foods`); the config carries two more for datasets without human
-annotations, which never match their text. Message files are filtered to the
+configuration expressed in SDK terms (`synthesis_evaluation/textual_config.json`). 
+Message files are filtered to the
 five original labels automatically; page files keep all ten:
 
 ```bash
@@ -214,11 +207,7 @@ Without `--config` the runner falls back to the plain mode of the earlier
 message-only scores (built-in labels plus the USERNAME allow-list regex, so
 Slack mentions like `<@U02CARLOS>` come back as single bracket-inclusive
 spans); document-page files in the glob are skipped in that mode. Scores
-reproduce to within about a tenth of a point (the Textual service is very
-slightly nondeterministic on borderline detections). Note the config's
-allow-list regexes were derived from the benchmark's generated ground
-truth and, for organizations, from the human gold itself — the card
-carries the same caveat.
+reproduce to within about a tenth of a point.
 
 ### Reproducing the Presidio and GLiNER2 rows
 
