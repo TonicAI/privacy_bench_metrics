@@ -60,28 +60,39 @@ Two judge providers:
     explicit region, authenticated by ``AWS_BEARER_TOKEN_BEDROCK`` when it is
     set and otherwise by the standard AWS credential chain. The SDK's own
     retries are off, so each judge call sends at most JUDGE_ATTEMPTS (5) HTTP
-    requests: it is retried with exponential backoff and jitter when it fails
-    with a throttling, overloaded, timeout, 5xx or connection error, including
-    one raised partway through the response stream; an auth, validation or
-    access-denied error is never retried. ``JudgeError`` is raised, with no
-    partial result, for missing credentials, nothing to judge, a call that
-    still fails, a response that does not parse, a response with a malformed
-    verdict for one of its pairs (no boolean ``coherent``, or a ``values``
-    that is not a list of ``{value, coherent}`` entries), a response that
-    judges none of its pairs, or a run in which every pair is unjudged. A
-    pair that a valid response leaves out still counts as skipped, as on the
-    default provider; ``pair_counts`` reports how many.
+    requests: it is retried when it fails with a throttling, overloaded,
+    timeout, 5xx or connection error, including one raised partway through
+    the response stream; an auth, validation or access-denied error is never
+    retried. The four waits back off exponentially from RETRY_BASE_SEC with
+    jitter, about two minutes in all, and each wait is at least the error's
+    ``retry-after-ms`` / ``retry-after`` hint, capped at RETRY_AFTER_CAP_SEC.
+    Each attempt is bounded by ATTEMPT_TIMEOUT_SEC, both between reads and
+    over the whole stream. ``JudgeError`` is raised, with no partial result,
+    for missing credentials, nothing to judge, a call that still fails, a
+    response that does not parse, a response with a malformed verdict for
+    one of its pairs (no boolean ``coherent``, or a ``values`` that is not a
+    list of ``{value, coherent}`` entries), a response that judges none of
+    its pairs, or a run in which every pair is unjudged. Only the verdicts
+    for a call's own pairs are kept, so the tallies and the metrics read
+    exactly the entries that were checked; a verdict for any other pair, or
+    under a label the call did not ask about, is dropped and counted in
+    ``usage.n_dropped_verdicts``. A pair that a valid response leaves out
+    still counts as skipped, as on the default provider; ``pair_counts``
+    reports how many.
 """
 from __future__ import annotations
 
 import concurrent.futures
+import email.utils
 import json
+import math
 import os
 import random
 import re
 import threading
 import time
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from .score_recall import _match_pred
@@ -138,11 +149,20 @@ def bedrock_credentials_problem(region: Optional[str]) -> Optional[str]:
     return None
 
 
+ATTEMPT_TIMEOUT_SEC = 300.0
+CONNECT_TIMEOUT_SEC = 10.0
+
+
 def _make_client(provider: str, region: Optional[str]):
     import anthropic
     if provider == PROVIDER_BEDROCK:
-        return anthropic.AnthropicBedrock(aws_region=region, max_retries=0)
+        return anthropic.AnthropicBedrock(aws_region=region, max_retries=0,
+                                          timeout=anthropic.Timeout(ATTEMPT_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC))
     return anthropic.Anthropic(max_retries=MAX_RETRIES)
+
+
+class AttemptTimeout(Exception):
+    """A judge attempt whose stream ran past ATTEMPT_TIMEOUT_SEC."""
 
 
 _RETRYABLE_STREAM_ERRORS = frozenset({
@@ -165,6 +185,8 @@ def _stream_error_code(exc: BaseException) -> Optional[str]:
 def is_retryable(exc: BaseException) -> bool:
     """Whether a failed judge call is worth retrying: throttling, overloaded, timeout, 5xx and connection errors
     are; auth, validation, access-denied and every other error are not."""
+    if isinstance(exc, AttemptTimeout):
+        return True
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and status != 200:
         return status in (408, 429) or status >= 500
@@ -194,9 +216,44 @@ class _Cancelled(Exception):
     """Another judge call already failed the run."""
 
 
+def _retry_after(exc: BaseException) -> Optional[float]:
+    """The wait, in seconds, that a failed response's ``retry-after-ms`` or ``retry-after`` header asks for."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    for name, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+        value = headers.get(name)
+        if value is None:
+            continue
+        try:
+            seconds = float(value) * scale
+        except (TypeError, ValueError):
+            if name == "retry-after-ms":
+                continue
+            try:
+                when = email.utils.parsedate_to_datetime(value)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = (when - datetime.now(timezone.utc)).total_seconds()
+        if math.isfinite(seconds):
+            return max(0.0, seconds)
+    return None
+
+
 JUDGE_ATTEMPTS = 5
-RETRY_BASE_SEC = 2.0
-RETRY_CAP_SEC = 30.0
+RETRY_BASE_SEC = 8.0
+RETRY_JITTER = 0.25
+RETRY_AFTER_CAP_SEC = 60.0
+
+
+def _retry_delay(attempt: int, exc: BaseException) -> float:
+    """The wait after failed attempt ``attempt``: 8, 16, 32 and 64 s (two minutes in all) give or take
+    RETRY_JITTER, and never less than the response's retry-after hint, capped at RETRY_AFTER_CAP_SEC."""
+    delay = RETRY_BASE_SEC * 2 ** (attempt - 1) * random.uniform(1 - RETRY_JITTER, 1 + RETRY_JITTER)
+    hint = _retry_after(exc)
+    return delay if hint is None else max(delay, min(hint, RETRY_AFTER_CAP_SEC))
 
 
 def _retry_sleep(stop: threading.Event, delay: float) -> bool:
@@ -210,14 +267,13 @@ def _call_llm_with_retries(client, system_prompt: str, user_msg: str,
         if stop.is_set():
             raise _Cancelled()
         try:
-            return _call_llm(client, system_prompt, user_msg)
+            return _call_llm(client, system_prompt, user_msg, deadline=time.monotonic() + ATTEMPT_TIMEOUT_SEC)
         except Exception as exc:
             if stop.is_set():
                 raise _Cancelled() from exc
             if attempt == JUDGE_ATTEMPTS or not is_retryable(exc):
                 raise _CallFailed(f"{describe_error(exc)} after {attempt} attempt(s)") from exc
-            delay = min(RETRY_CAP_SEC, RETRY_BASE_SEC * 2 ** (attempt - 1))
-            if _retry_sleep(stop, delay / 2 + random.uniform(0, delay / 2)):
+            if _retry_sleep(stop, _retry_delay(attempt, exc)):
                 raise _Cancelled() from exc
     raise AssertionError("unreachable")
 
@@ -749,7 +805,7 @@ def _build_org_user_message(grp: str, mapping: Dict[str, Dict[str, List[str]]]) 
     return "\n".join(parts)
 
 
-def _call_llm(client, system_prompt: str, user_msg: str) -> Tuple[str, dict]:
+def _call_llm(client, system_prompt: str, user_msg: str, deadline: Optional[float] = None) -> Tuple[str, dict]:
     with client.messages.stream(
         model=MODEL,
         max_tokens=MAX_TOKENS,
@@ -761,6 +817,10 @@ def _call_llm(client, system_prompt: str, user_msg: str) -> Tuple[str, dict]:
         messages=[{"role": "user", "content": user_msg}],
         thinking={"type": "adaptive"},
     ) as stream:
+        if deadline is not None:
+            for _event in stream:
+                if time.monotonic() > deadline:
+                    raise AttemptTimeout()
         resp = stream.get_final_message()
     text_parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
     raw = "".join(text_parts)
@@ -880,6 +940,14 @@ def pair_counts(result: dict) -> Tuple[int, int]:
     return skipped, total
 
 
+def _in_scope(parsed: dict, mapping: Dict[str, Dict[str, List[str]]], allowed: Tuple[str, ...],
+              default_label: str) -> Tuple[dict, int]:
+    """A checked reply cut down to its verdicts for ``mapping``'s pairs, the entries ``_reply_problem`` checked,
+    and how many other entries it dropped."""
+    matching = _matching_verdicts(parsed, mapping, allowed, default_label)
+    return {"verdicts": [entry for _, entry in matching]}, len(parsed["verdicts"]) - len(matching)
+
+
 def _reply_problem(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
                    allowed: Tuple[str, ...], default_label: str) -> Optional[str]:
     """Why a bedrock reply cannot be used, or None; names counts only, never the pairs."""
@@ -950,7 +1018,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     metrics_lock = threading.Lock()
     totals = {"input_tokens": 0, "output_tokens": 0,
               "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
-              "n_calls": 0, "n_parse_failures": 0}
+              "n_calls": 0, "n_parse_failures": 0, "n_dropped_verdicts": 0}
 
     def _record(usage, parsed):
         with metrics_lock:
@@ -960,6 +1028,12 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             totals["n_calls"] += 1
             if parsed is None:
                 totals["n_parse_failures"] += 1
+
+    def _keep_in_scope(parsed, mapping, allowed, default_label) -> dict:
+        kept, dropped = _in_scope(parsed, mapping, allowed, default_label)
+        with metrics_lock:
+            totals["n_dropped_verdicts"] += dropped
+        return kept
 
     def _call(system_prompt: str, user_msg: str) -> Tuple[str, dict]:
         if strict:
@@ -991,6 +1065,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             problem = _reply_problem(parsed, mappings[cid], CHAR_LABELS, "")
             if problem:
                 return cid, None, problem, raw
+            parsed = _keep_in_scope(parsed, mappings[cid], CHAR_LABELS, "")
         return cid, parsed, None, raw
 
     def process_org(grp: str) -> Optional[Tuple[str, Optional[dict], Optional[str], str]]:
@@ -1032,6 +1107,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
                 if problem:
                     first_error = f"chunk {n_chunk + 1} of {len(chunks)}: {problem}"
                     break
+                parsed = _keep_in_scope(parsed, piece, ORG_LABELS, "ORGANIZATION")
             if parsed and isinstance(parsed.get("verdicts"), list):
                 verdicts.extend(parsed["verdicts"])
         if strict and first_error:
@@ -1054,6 +1130,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             problem = _reply_problem(parsed, unowned_batches[i], LABELS, "")
             if problem:
                 return f"batch_{i}", None, problem, raw
+            parsed = _keep_in_scope(parsed, unowned_batches[i], LABELS, "")
         return f"batch_{i}", parsed, None, raw
 
     char_index = {cid: i for i, cid in enumerate(chars)}
@@ -1073,6 +1150,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     per_org_group: Dict[str, dict] = {}
     per_unowned: Dict[str, dict] = {}
     failure: Optional[JudgeError] = None
+    aborted = False
     exe = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
         char_futs = {exe.submit(_guarded, stop, strict, process_one, cid): ("char", cid) for cid in chars}
@@ -1108,8 +1186,14 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             if n % PROGRESS_EVERY == 0 or n == len(all_futs):
                 dt = time.monotonic() - t0
                 print(f"    {n}/{len(all_futs)} done in {dt:.0f}s")
+    except BaseException:
+        if strict:
+            aborted = True
+            stop.set()
+        raise
     finally:
-        exe.shutdown(wait=failure is None, cancel_futures=failure is not None)
+        abort = aborted or failure is not None
+        exe.shutdown(wait=not abort, cancel_futures=abort)
     if failure is not None:
         raise failure
 
@@ -1185,6 +1269,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             "output_tokens":    totals["output_tokens"],
             "cache_read_input_tokens":     totals["cache_read_input_tokens"],
             "cache_creation_input_tokens": totals["cache_creation_input_tokens"],
+            **({"n_dropped_verdicts": totals["n_dropped_verdicts"]} if strict else {}),
         },
         "per_label_totals":      per_label_totals,
         "per_label_span_totals": per_label_span_totals,

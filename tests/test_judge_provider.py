@@ -7,11 +7,16 @@ No test touches the network: the `anthropic` (and, where needed, `boto3`) module
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import concurrent.futures
 import contextlib
+import datetime
+import email.utils
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
@@ -65,6 +70,11 @@ class _Stream:
     def __exit__(self, *exc):
         return False
 
+    def __iter__(self):
+        if isinstance(self._reply, Exception):
+            raise self._reply
+        yield from ("message_start", "message_stop")
+
     def get_final_message(self):
         if isinstance(self._reply, Exception):
             raise self._reply
@@ -98,8 +108,20 @@ def _fake_client_class(name: str, reply):
     return FakeClient
 
 
+class FakeTimeout:
+    def __init__(self, timeout, *, connect=None):
+        self.timeout, self.connect = timeout, connect
+
+    def __eq__(self, other):
+        return isinstance(other, FakeTimeout) and (self.timeout, self.connect) == (other.timeout, other.connect)
+
+    def __repr__(self):
+        return f"FakeTimeout({self.timeout}, connect={self.connect})"
+
+
 def _fake_anthropic(reply=json.dumps(GOOD_VERDICTS), bedrock_reply=None):
     mod = types.ModuleType("anthropic")
+    mod.Timeout = FakeTimeout
     mod.Anthropic = _fake_client_class("Anthropic", reply)
     mod.AnthropicBedrock = _fake_client_class("AnthropicBedrock", reply if bedrock_reply is None else bedrock_reply)
     return mod
@@ -108,10 +130,12 @@ def _fake_anthropic(reply=json.dumps(GOOD_VERDICTS), bedrock_reply=None):
 class FakeStatusError(Exception):
     """Shaped like the SDK's APIStatusError; a mid-stream error frame arrives with status 200 and an error code."""
 
-    def __init__(self, status_code: int, code=None):
+    def __init__(self, status_code: int, code=None, headers=None):
         super().__init__("Megan Donovan works at Acme00")
         self.status_code = status_code
         self.body = {"type": "error", "error": {"type": code, "message": "Megan"}} if code else None
+        if headers is not None:
+            self.response = types.SimpleNamespace(headers=headers)
 
 
 class APIConnectionError(Exception):
@@ -143,12 +167,24 @@ def _user_text(kwargs) -> str:
     return kwargs["messages"][0]["content"]
 
 
+def _org_entry(surface: str, coherent=True, **extra) -> dict:
+    return {"label": "ORGANIZATION", "surface": surface, "coherent": coherent, "values": [], "issues": [],
+            "confidence": "sure", **extra}
+
+
 def _org_verdict(surface: str) -> str:
-    return json.dumps({"verdicts": [{"label": "ORGANIZATION", "surface": surface, "coherent": True,
-                                     "values": [], "issues": [], "confidence": "sure"}]})
+    return json.dumps({"verdicts": [_org_entry(surface)]})
 
 
 ORG_GROUP = "Acme Holdings"
+CHUNK_1 = [f"Acme{i:02d}" for i in range(25)]
+CHUNK_2 = [f"Acme{i:02d}" for i in range(25, 30)]
+UNOWNED_GOOD = json.dumps({"verdicts": [{"label": "ORGANIZATION", "surface": "Globex", "coherent": True,
+                                         "values": [{"value": "Initech", "coherent": True}]}]})
+
+
+def _is_unowned_call(kwargs) -> bool:
+    return kwargs["system"][0]["text"] == score_realism_llm.UNOWNED_SYSTEM_PROMPT
 
 
 def _write_fixture(root: Path, org_surfaces: int = 0, unowned: bool = False) -> dict:
@@ -229,10 +265,15 @@ class JudgeCliTestCase(unittest.TestCase):
     def run_dir(self, name: str = "run") -> Path:
         return self.paths["runs"] / name
 
-    def run_main(self, *extra: str, name: str = "run", anthropic_module=None, credentials_problem=None):
+    def assert_nothing_written(self):
+        runs = self.paths["runs"]
+        self.assertEqual(sorted(p.name for p in runs.iterdir()) if runs.exists() else [], [])
+
+    def run_main(self, *extra: str, name: str = "run", anthropic_module=None, credentials_problem=None,
+                 runs_dir=None):
         argv = ["run_eval_native", "--predictions", str(self.paths["predictions"]),
                 "--ground-truth", str(self.paths["ground_truth"]), "--characters", str(self.paths["characters"]),
-                "--run-name", name, "--runs-dir", str(self.paths["runs"]), "--workers", "2", *extra]
+                "--run-name", name, "--runs-dir", str(runs_dir or self.paths["runs"]), "--workers", "2", *extra]
         module = anthropic_module if anthropic_module is not None else _fake_anthropic()
         stdout, stderr = io.StringIO(), io.StringIO()
         code = 0
@@ -257,7 +298,7 @@ class ArgumentValidationTests(JudgeCliTestCase):
         code, _, err, module = self.run_main(*extra)
         self.assertNotEqual(code, 0)
         self.assertIn(message, err)
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
         self.assertEqual(module.AnthropicBedrock.instances, [])
         self.assertEqual(module.Anthropic.instances, [])
 
@@ -284,7 +325,7 @@ class ArgumentValidationTests(JudgeCliTestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("bedrock judge unavailable: no AWS credentials found", err)
         self.assertNotIn("loading predictions", out)
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
         self.assertEqual(module.AnthropicBedrock.instances, [])
 
 
@@ -296,7 +337,8 @@ class BedrockJudgeTests(JudgeCliTestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(module.Anthropic.instances, [])
         [client] = module.AnthropicBedrock.instances
-        self.assertEqual(client.kwargs, {"aws_region": "eu-west-1", "max_retries": 0})
+        self.assertEqual(client.kwargs, {"aws_region": "eu-west-1", "max_retries": 0,
+                                         "timeout": FakeTimeout(300.0, connect=10.0)})
         [request] = client.requests
         self.assertEqual(request["model"], "global.anthropic.claude-opus-5-5")
         self.assertEqual(request["max_tokens"], 12_000)
@@ -315,7 +357,9 @@ class BedrockJudgeTests(JudgeCliTestCase):
         self.assertFalse(results["metrics"]["judge_skipped"])
         self.assertEqual(overall["synthesis_accuracy"], 1.0)
         self.assertEqual(overall["combined_accuracy"], 1.0)
+        self.assertEqual(judge["usage"]["n_dropped_verdicts"], 0)
         self.assertNotIn("eu-west-1", json.dumps(results))
+        self.assertEqual(sorted(p.name for p in self.paths["runs"].iterdir()), ["run"])
 
     def test_region_falls_back_to_aws_region_then_aws_default_region(self):
         os.environ["AWS_DEFAULT_REGION"] = "us-west-2"
@@ -352,8 +396,7 @@ class BedrockJudgeTests(JudgeCliTestCase):
         self.assertNotIn("123456789012", err)
         self.assertNotIn("assumed-role", err)
         self.assertEqual(len(module.AnthropicBedrock.instances[0].requests), 1)
-        self.assertFalse((self.run_dir() / "results.json").exists())
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
 
     def test_unparseable_response_fails_the_run(self):
         module = _fake_anthropic(bedrock_reply="I cannot help with that.")
@@ -362,7 +405,7 @@ class BedrockJudgeTests(JudgeCliTestCase):
                                         anthropic_module=module)
         self.assertNotEqual(code, 0)
         self.assertIn("did not parse", err)
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
 
     def test_score_raises_when_nothing_to_judge(self):
         with mock.patch.dict(sys.modules, {"anthropic": _fake_anthropic()}), \
@@ -378,7 +421,7 @@ class BedrockReplyCoverageTests(JudgeCliTestCase):
         code, out, err, _ = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
         self.assertNotEqual(code, 0)
         self.assertIn(message, err)
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
         for gold in ("Megan", "Donovan", "c1"):
             self.assertNotIn(gold, err)
         return out, err
@@ -420,6 +463,12 @@ class BedrockReplyCoverageTests(JudgeCliTestCase):
         good = GOOD_VERDICTS["verdicts"]
         self.assert_malformed({**good[0], "values": [{"value": "Damon", "coherent": "yes"}]}, good[1], malformed=1)
 
+    def test_value_entry_without_a_string_value_fails(self):
+        good = GOOD_VERDICTS["verdicts"]
+        for entry in ({"coherent": True}, {"value": 7, "coherent": True}):
+            with self.subTest(entry=entry):
+                self.assert_malformed({**good[0], "values": [entry]}, good[1], malformed=1)
+
     def test_values_that_are_not_a_list_fail(self):
         good = GOOD_VERDICTS["verdicts"]
         for values in (1, "Damon", {"value": "Damon", "coherent": True}):
@@ -437,7 +486,7 @@ class BedrockReplyCoverageTests(JudgeCliTestCase):
         with mock.patch.object(score_realism_llm, "score", side_effect=TypeError("boom")):
             with self.assertRaises(TypeError):
                 self.run_main(*BEDROCK)
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
 
     def test_partial_omission_counts_as_skipped_and_is_printed(self):
         reply = json.dumps({"verdicts": GOOD_VERDICTS["verdicts"][:1]})
@@ -452,6 +501,19 @@ class BedrockReplyCoverageTests(JudgeCliTestCase):
         code, out, err, _ = self.run_main(*BEDROCK)
         self.assertEqual(code, 0, err)
         self.assertIn("judge: 0 of 2 pairs unjudged (0.0%)", out)
+        self.assertIn("judge: 0 verdict(s) for pairs outside their call dropped", out)
+
+    def test_verdicts_outside_the_call_are_dropped_and_counted(self):
+        extra = [{"label": "NAME_GIVEN", "surface": "Meg", "coherent": "no", "values": []}, "ok",
+                 {"label": "ORGANIZATION", "surface": "Megan", "coherent": False}]
+        reply = json.dumps({"verdicts": GOOD_VERDICTS["verdicts"] + extra})
+        code, out, err, _ = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
+        self.assertEqual(code, 0, err)
+        self.assertIn("judge: 3 verdict(s) for pairs outside their call dropped", out)
+        judge = self.results()["detail"]["judge"]
+        self.assertEqual(judge["usage"]["n_dropped_verdicts"], 3)
+        self.assertEqual(judge["per_character"]["c1"]["parsed"], GOOD_VERDICTS)
+        self.assertIn("Meg", judge["per_character"]["c1"]["raw"])
 
 
 class BedrockRetryTests(JudgeCliTestCase):
@@ -493,7 +555,7 @@ class BedrockRetryTests(JudgeCliTestCase):
         self.assertIn("FakeStatusError (HTTP 403) after 1 attempt(s)", err)
         self.assertEqual(len(requests), 1)
         self.sleep.assert_not_called()
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
 
     def test_retries_are_bounded_with_exponential_backoff(self):
         code, _, err, requests = self.run_with(FakeStatusError(200, "throttlingException"))
@@ -502,11 +564,51 @@ class BedrockRetryTests(JudgeCliTestCase):
         self.assertEqual(len(requests), score_realism_llm.JUDGE_ATTEMPTS)
         delays = [c.args[1] for c in self.sleep.call_args_list]
         self.assertEqual(len(delays), score_realism_llm.JUDGE_ATTEMPTS - 1)
-        for attempt, delay in enumerate(delays, 1):
-            ceiling = min(score_realism_llm.RETRY_CAP_SEC, score_realism_llm.RETRY_BASE_SEC * 2 ** (attempt - 1))
-            self.assertGreaterEqual(delay, ceiling / 2)
-            self.assertLessEqual(delay, ceiling)
-        self.assertFalse(self.run_dir().exists())
+        for nominal, delay in zip((8, 16, 32, 64), delays):
+            self.assertGreaterEqual(delay, nominal * 0.75)
+            self.assertLessEqual(delay, nominal * 1.25)
+        self.assert_nothing_written()
+
+    def test_the_backoff_spans_about_two_minutes(self):
+        exc = FakeStatusError(429)
+        for _ in range(200):
+            total = sum(score_realism_llm._retry_delay(a, exc) for a in range(1, score_realism_llm.JUDGE_ATTEMPTS))
+            self.assertGreaterEqual(total, 90)
+            self.assertLessEqual(total, 150)
+
+    def test_retry_after_is_honoured_and_capped(self):
+        soon = email.utils.format_datetime(
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=40), usegmt=True)
+        cases = [({"retry-after": "45"}, 45, 64 * 1.25), ({"retry-after-ms": "30000"}, 30, 64 * 1.25),
+                 ({"retry-after-ms": "soon", "retry-after": "20"}, 20, 64 * 1.25),
+                 ({"retry-after": "3600"}, 60, 64 * 1.25), ({"retry-after": soon}, 35, 64 * 1.25)]
+        for headers, floor, ceiling in cases:
+            for attempt in range(1, score_realism_llm.JUDGE_ATTEMPTS):
+                with self.subTest(headers=headers, attempt=attempt):
+                    delay = score_realism_llm._retry_delay(attempt, FakeStatusError(429, headers=headers))
+                    self.assertGreaterEqual(delay, floor)
+                    self.assertLessEqual(delay, max(ceiling, floor))
+        self.assertEqual(score_realism_llm._retry_delay(1, FakeStatusError(429, headers={"retry-after": "3600"})),
+                         score_realism_llm.RETRY_AFTER_CAP_SEC)
+        for headers in ({}, {"retry-after": "soon"}, {"retry-after": "nan"}, {"retry-after": "-5"}):
+            with self.subTest(headers=headers):
+                self.assertLessEqual(score_realism_llm._retry_delay(1, FakeStatusError(429, headers=headers)), 10)
+
+    def test_retry_after_sets_the_wait(self):
+        code, _, err, requests = self.run_with(_replies(FakeStatusError(429, headers={"retry-after": "50"}),
+                                                        json.dumps(GOOD_VERDICTS)))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(requests), 2)
+        [call] = self.sleep.call_args_list
+        self.assertGreaterEqual(call.args[1], 50)
+
+    def test_an_attempt_past_its_deadline_is_retried_then_fails(self):
+        with mock.patch.object(score_realism_llm, "ATTEMPT_TIMEOUT_SEC", -1.0):
+            code, _, err, requests = self.run_with(json.dumps(GOOD_VERDICTS))
+        self.assertNotEqual(code, 0)
+        self.assertIn("character 1 of 1 failed: AttemptTimeout after 5 attempt(s)", err)
+        self.assertEqual(len(requests), score_realism_llm.JUDGE_ATTEMPTS)
+        self.assert_nothing_written()
 
     def test_error_message_carries_no_exception_text(self):
         _, out, err, _ = self.run_with(FakeStatusError(200, "throttlingException"))
@@ -539,7 +641,7 @@ class BedrockOrgGroupTests(JudgeCliTestCase):
             bedrock_reply=self.org_reply(first_chunk)))
         self.assertNotEqual(code, 0)
         self.assertIn(f"bedrock judge call for org group 1 of 1 failed: chunk 1 of 2: {message}", err)
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
         self.assertNotIn("Acme", err + out)
         self.assertNotIn(ORG_GROUP, err + out)
 
@@ -595,6 +697,138 @@ class BedrockOrgGroupTests(JudgeCliTestCase):
         self.assertEqual([_is_org_call(r) for r in requests], [False, True])
 
 
+class BedrockOutOfScopeVerdictTests(JudgeCliTestCase):
+    """R-15: only the verdicts a call was asked for are stored, so the tallies and the metrics read the set that
+    was checked. Chunk 1 holds Acme00..Acme24, chunk 2 Acme25..Acme29; with the character's 2 pairs, 32 pairs."""
+
+    org_surfaces = 30
+
+    def run_chunks(self, chunk_1, chunk_2):
+        def reply(kwargs):
+            if not _is_org_call(kwargs):
+                return json.dumps(GOOD_VERDICTS)
+            return json.dumps({"verdicts": chunk_1 if "'Acme00'" in _user_text(kwargs) else chunk_2})
+        code, out, err, _ = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
+        self.assertEqual(code, 0, err)
+        return self.results(), out
+
+    def assert_scored(self, results, out, coherent, incoherent, skipped, dropped=1):
+        overall = results["metrics"]["overall"]
+        self.assertEqual((overall["coherent"], overall["incoherent"], overall["skipped"]),
+                         (coherent, incoherent, skipped))
+        judge = results["detail"]["judge"]
+        org = judge["org_by_label_totals"]["ORGANIZATION"]
+        self.assertEqual((org["coherent"], org["incoherent"], org["skipped"]),
+                         (coherent - 2, incoherent, skipped))
+        self.assertEqual(judge["usage"]["n_dropped_verdicts"], dropped)
+        self.assertIn(f"judge: {skipped} of 32 pairs unjudged", out)
+        self.assertIn(f"judge: {dropped} verdict(s) for pairs outside their call dropped", out)
+
+    def test_a_person_labelled_org_verdict_is_dropped(self):
+        chunk_1 = [_org_entry("Acme00", "false", label="NAME_GIVEN")] + [_org_entry(s) for s in CHUNK_1[1:]]
+        results, out = self.run_chunks(chunk_1, [_org_entry(s) for s in CHUNK_2])
+        self.assert_scored(results, out, coherent=31, incoherent=0, skipped=1)
+        stored = results["detail"]["judge"]["per_org_group"][ORG_GROUP]
+        self.assertEqual(len(stored["parsed"]["verdicts"]), 29)
+        self.assertIn("NAME_GIVEN", stored["raw"])
+
+    def test_a_malformed_verdict_for_another_chunk_does_not_fill_its_pair(self):
+        chunk_1 = [_org_entry(s) for s in CHUNK_1] + [{"surface": "Acme29", "coherent": "false"}]
+        results, out = self.run_chunks(chunk_1, [_org_entry(s) for s in CHUNK_2[:-1]])
+        self.assert_scored(results, out, coherent=31, incoherent=0, skipped=1)
+
+    def test_a_verdict_for_another_chunk_does_not_override_its_pair(self):
+        chunk_2 = [_org_entry(s) for s in CHUNK_2] + [_org_entry("Acme00", False)]
+        results, out = self.run_chunks([_org_entry(s) for s in CHUNK_1], chunk_2)
+        self.assert_scored(results, out, coherent=32, incoherent=0, skipped=0)
+        self.assertEqual(results["metrics"]["overall"]["synthesis_accuracy"], 1.0)
+
+    def test_a_verdict_for_another_chunk_does_not_fill_its_pair(self):
+        chunk_1 = [_org_entry(s) for s in CHUNK_1] + [_org_entry("Acme29", False)]
+        results, out = self.run_chunks(chunk_1, [_org_entry(s) for s in CHUNK_2[:-1]])
+        self.assert_scored(results, out, coherent=31, incoherent=0, skipped=1)
+
+
+class BedrockUnownedTests(JudgeCliTestCase):
+    """R-19: an unowned batch's reply is checked like any other owner's."""
+
+    unowned = True
+
+    def run_with(self, unowned_reply):
+        def reply(kwargs):
+            return unowned_reply if _is_unowned_call(kwargs) else json.dumps(GOOD_VERDICTS)
+        return self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
+
+    def assert_fails(self, unowned_reply, message):
+        code, out, err, _ = self.run_with(unowned_reply)
+        self.assertNotEqual(code, 0)
+        self.assertIn(f"bedrock judge call for unowned batch 1 of 1 failed: {message}", err)
+        self.assertNotIn("Globex", err + out)
+        self.assert_nothing_written()
+
+    def test_a_judged_batch_is_scored(self):
+        code, out, err, _ = self.run_with(UNOWNED_GOOD)
+        self.assertEqual(code, 0, err)
+        self.assertIn("judge: 0 of 3 pairs unjudged", out)
+        self.assertEqual(self.results()["metrics"]["overall"]["coherent"], 3)
+
+    def test_a_batch_verdict_outside_the_batch_is_dropped(self):
+        extra = {"label": "NAME_GIVEN", "surface": "Megan", "coherent": False}
+        reply = json.dumps({"verdicts": json.loads(UNOWNED_GOOD)["verdicts"] + [extra]})
+        code, out, err, _ = self.run_with(reply)
+        self.assertEqual(code, 0, err)
+        self.assertIn("judge: 1 verdict(s) for pairs outside their call dropped", out)
+        judge = self.results()["detail"]["judge"]
+        self.assertEqual(judge["per_unowned"]["batch_0"]["parsed"], json.loads(UNOWNED_GOOD))
+        self.assertEqual(self.results()["metrics"]["overall"]["coherent"], 3)
+
+    def test_a_batch_judging_none_of_its_pairs_fails(self):
+        self.assert_fails(json.dumps({"verdicts": []}), "the response judged none of its 1 pairs")
+
+    def test_a_malformed_batch_verdict_fails(self):
+        reply = json.dumps({"verdicts": [{"label": "ORGANIZATION", "surface": "Globex", "coherent": "true",
+                                          "values": []}]})
+        self.assert_fails(reply, "1 of the response's 1 verdicts for its pairs are malformed")
+
+
+class BedrockRunDirTests(JudgeCliTestCase):
+    """R-17: an unusable --runs-dir or a taken run name fails before any judge call, and the run is built in a
+    hidden sibling that is renamed into place at the end, so a late failure leaves nothing."""
+
+    def test_an_unusable_runs_dir_fails_before_any_call(self):
+        blocker = Path(self._tmp.name) / "blocker"
+        blocker.write_text("")
+        code, out, err, module = self.run_main(*BEDROCK, runs_dir=blocker / "runs")
+        self.assertNotEqual(code, 0)
+        self.assertIn(f"cannot write the run dir under {blocker / 'runs'}", err)
+        self.assertNotIn("loading predictions", out)
+        self.assertEqual(module.AnthropicBedrock.instances, [])
+
+    def test_a_taken_run_name_fails_before_any_call(self):
+        self.run_dir().mkdir(parents=True)
+        code, out, err, module = self.run_main(*BEDROCK)
+        self.assertNotEqual(code, 0)
+        self.assertIn("refusing to overwrite existing run dir", err)
+        self.assertEqual(module.AnthropicBedrock.instances, [])
+
+    def test_a_failure_after_results_are_written_leaves_nothing(self):
+        with mock.patch.object(run_eval_native, "render", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.run_main(*BEDROCK)
+        self.assert_nothing_written()
+
+    def test_a_run_dir_created_meanwhile_is_not_replaced(self):
+        def reply(_kwargs):
+            self.run_dir().mkdir(parents=True, exist_ok=True)
+            (self.run_dir() / "theirs").write_text("")
+            return json.dumps(GOOD_VERDICTS)
+        code, _, err, _ = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
+        self.assertNotEqual(code, 0)
+        self.assertIn("refusing to overwrite existing run dir", err)
+        self.assertEqual(sorted(p.name for p in self.paths["runs"].iterdir()), ["run"])
+        self.assertEqual(sorted(p.name for p in self.run_dir().iterdir()), ["theirs"])
+
+
 class BedrockCancellationTests(JudgeCliTestCase):
     """R-8 and R-13: once a call fails the run, queued work is cancelled, no further request is sent, and score()
     does not wait for calls in flight. Ordering comes from events, not timing."""
@@ -637,7 +871,45 @@ class BedrockCancellationTests(JudgeCliTestCase):
         self.assertEqual(shutdowns, [{"wait": False, "cancel_futures": True}])
         requests = module.AnthropicBedrock.instances[0].requests
         self.assertEqual(len(requests), 2)
-        self.assertFalse(self.run_dir().exists())
+        self.assert_nothing_written()
+
+    def test_an_unexpected_worker_error_cancels_queued_calls(self):
+        """R-18: the org group's first chunk is in flight when the character worker raises. Its second chunk must
+        not be sent, and the run must not wait for the in-flight chunk."""
+        org_started, shutdown_called = threading.Event(), threading.Event()
+        shutdowns = []
+
+        class SpyExecutor(concurrent.futures.ThreadPoolExecutor):
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                shutdowns.append({"wait": wait, "cancel_futures": cancel_futures})
+                shutdown_called.set()
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+        def reply(kwargs):
+            if _is_org_call(kwargs):
+                org_started.set()
+                shutdown_called.wait(timeout=5)
+                return _org_verdict("Acme00")
+            return UNOWNED_GOOD
+
+        def broken_roster(*_args, **_kwargs):
+            org_started.wait(timeout=5)
+            raise TypeError("roster")
+
+        module = _fake_anthropic(bedrock_reply=reply)
+        with mock.patch.object(concurrent.futures, "ThreadPoolExecutor", SpyExecutor), \
+                mock.patch.object(score_realism_llm, "_build_user_message", side_effect=broken_roster):
+            with self.assertRaises(TypeError):
+                self.run_main(*BEDROCK, "--workers", "2", anthropic_module=module)
+            for thread in threading.enumerate():
+                if thread.name.startswith("ThreadPoolExecutor"):
+                    thread.join(timeout=5)
+        self.assertTrue(org_started.is_set())
+        self.assertEqual(shutdowns, [{"wait": False, "cancel_futures": True}])
+        requests = module.AnthropicBedrock.instances[0].requests
+        self.assertEqual(sum(_is_org_call(r) for r in requests), 1)
+        self.assertFalse(any(not _is_org_call(r) and not _is_unowned_call(r) for r in requests))
+        self.assert_nothing_written()
 
 
 class GuardedTests(unittest.TestCase):
@@ -696,6 +968,31 @@ def _real_sdk():
     return anthropic if hasattr(anthropic, "AnthropicBedrock") else None
 
 
+def _frame(headers: dict, payload: bytes) -> bytes:
+    """One AWS event-stream message, as Bedrock sends it."""
+    hb = b"".join(bytes([len(k)]) + k.encode() + b"\x07" + struct.pack(">H", len(v)) + v.encode()
+                  for k, v in headers.items())
+    prelude = struct.pack(">II", 12 + len(hb) + len(payload) + 4, len(hb))
+    msg = prelude + struct.pack(">I", binascii.crc32(prelude) & 0xFFFFFFFF) + hb + payload
+    return msg + struct.pack(">I", binascii.crc32(msg) & 0xFFFFFFFF)
+
+
+def _event_stream(text: str) -> bytes:
+    events = [
+        {"type": "message_start", "message": {"id": "m", "type": "message", "role": "assistant", "model": "x",
+                                              "content": [], "stop_reason": None, "stop_sequence": None,
+                                              "usage": {"input_tokens": 1, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+         "usage": {"output_tokens": 3}},
+        {"type": "message_stop"}]
+    headers = {":event-type": "chunk", ":content-type": "application/json", ":message-type": "event"}
+    return b"".join(_frame(headers, json.dumps({"bytes": base64.b64encode(json.dumps(e).encode()).decode()}).encode())
+                    for e in events)
+
+
 @unittest.skipUnless(_real_sdk(), "needs anthropic[bedrock] installed")
 class RealSdkRequestCountTests(unittest.TestCase):
     """R-12 against the real SDK over a mock transport: a judge call sends at most JUDGE_ATTEMPTS requests."""
@@ -707,12 +1004,11 @@ class RealSdkRequestCountTests(unittest.TestCase):
         for key in ("AWS_BEARER_TOKEN_BEDROCK", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
             os.environ.pop(key, None)
         sleep = mock.patch.object(score_realism_llm, "_retry_sleep", return_value=False)
-        sleep.start()
+        self.sleep = sleep.start()
         self.addCleanup(sleep.stop)
 
-    def count_requests(self, respond) -> int:
+    def client(self, respond, requests):
         import httpx2
-        requests = []
 
         def handler(request):
             requests.append(request.url.path)
@@ -720,11 +1016,47 @@ class RealSdkRequestCountTests(unittest.TestCase):
 
         client = score_realism_llm._make_client("bedrock", "us-east-1")
         client._client = httpx2.Client(transport=httpx2.MockTransport(handler))
+        return client
+
+    def count_requests(self, respond) -> int:
+        requests = []
+        client = self.client(respond, requests)
         with self.assertRaises(score_realism_llm._CallFailed) as caught:
             score_realism_llm._call_llm_with_retries(client, "system", "user", threading.Event())
         self.assertIn(f"after {score_realism_llm.JUDGE_ATTEMPTS} attempt(s)", str(caught.exception))
         self.assertTrue(all(p.endswith("/invoke-with-response-stream") for p in requests))
         return len(requests)
+
+    def test_client_timeout(self):
+        import anthropic
+        client = score_realism_llm._make_client("bedrock", "us-east-1")
+        self.assertEqual(client.max_retries, 0)
+        self.assertEqual(client.timeout, anthropic.Timeout(300.0, connect=10.0))
+
+    def test_retry_after_is_honoured(self):
+        import httpx2
+        self.assertEqual(self.count_requests(
+            lambda r: httpx2.Response(429, headers={"retry-after": "60"}, json={"message": "slow down"})),
+            score_realism_llm.JUDGE_ATTEMPTS)
+        delays = [c.args[1] for c in self.sleep.call_args_list]
+        self.assertEqual(len(delays), score_realism_llm.JUDGE_ATTEMPTS - 1)
+        self.assertTrue(all(60 <= d <= 80 for d in delays), delays)
+
+    def test_a_streamed_reply_within_its_deadline(self):
+        import httpx2
+        requests = []
+        client = self.client(lambda r: httpx2.Response(
+            200, headers={"content-type": "application/vnd.amazon.eventstream"}, content=_event_stream("ok")),
+            requests)
+        raw, usage = score_realism_llm._call_llm_with_retries(client, "system", "user", threading.Event())
+        self.assertEqual((raw, usage["output_tokens"], len(requests)), ("ok", 3, 1))
+
+    def test_a_streamed_reply_past_its_deadline(self):
+        import httpx2
+        with mock.patch.object(score_realism_llm, "ATTEMPT_TIMEOUT_SEC", -1.0):
+            self.assertEqual(self.count_requests(lambda r: httpx2.Response(
+                200, headers={"content-type": "application/vnd.amazon.eventstream"}, content=_event_stream("ok"))),
+                score_realism_llm.JUDGE_ATTEMPTS)
 
     def test_sustained_throttling(self):
         import httpx2
@@ -822,6 +1154,8 @@ class AnthropicDefaultTests(JudgeCliTestCase):
         self.assertEqual(list(results["detail"]["judge"])[:2], ["model", "usage"])
         self.assertIn("LLM judge (claude-opus-5-5) ...", out)
         self.assertNotIn("pairs unjudged", out)
+        self.assertNotIn("dropped", out)
+        self.assertNotIn("n_dropped_verdicts", results["detail"]["judge"]["usage"])
 
     def test_failing_call_still_counts_as_skipped(self):
         os.environ["ANTHROPIC_API_KEY"] = "fake"

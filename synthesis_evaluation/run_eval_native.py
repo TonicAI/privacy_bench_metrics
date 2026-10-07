@@ -39,15 +39,19 @@ a throttling, overloaded, timeout, 5xx or connection error, including partway th
 with backoff; the SDK's own retries are off, so a judge call sends at most 5 HTTP requests. Auth, validation
 and access-denied errors are not retried. Missing credentials, a call that still fails, a reply that does not
 parse, has a malformed verdict for one of its pairs or judges none of them, or a run with every pair unjudged
-exits non-zero; the run directory is created only once the judge has succeeded, so a failed run leaves none.
-Pairs left out of an otherwise valid reply count as skipped, and the run prints how many.
+exits non-zero. The run is built in a hidden sibling of the run directory, created before the judge starts, so
+an unusable --runs-dir fails before any judge call; it is renamed into place only once everything is written,
+so a failed run leaves nothing behind. Verdicts for pairs outside their call are dropped and counted, and pairs
+left out of an otherwise valid reply count as skipped; the run prints both counts.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -103,6 +107,21 @@ def render_by_kind(by_kind: Dict[str, dict], diag: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _staging_dir(out_dir: Path) -> Path:
+    """A fresh hidden sibling of ``out_dir`` to build the run in; exits when ``out_dir``'s parent cannot hold it."""
+    try:
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.partial-", dir=out_dir.parent))
+    except OSError as exc:
+        sys.exit(f"cannot write the run dir under {out_dir.parent}: {exc.strerror or type(exc).__name__}")
+
+
+def _publish(staging: Path, out_dir: Path) -> None:
+    if out_dir.exists():
+        sys.exit(f"refusing to overwrite existing run dir: {out_dir}")
+    os.rename(staging, out_dir)
+
+
 def resolve_judge(ap: argparse.ArgumentParser, args: argparse.Namespace) -> Optional[str]:
     """Validate the judge flags; returns the bedrock region (None for the anthropic provider).
     Exits through ``ap.error`` on an invalid combination."""
@@ -155,8 +174,19 @@ def main() -> int:
     if out_dir.exists():
         sys.exit(f"refusing to overwrite existing run dir: {out_dir}")
     bedrock = judge_region is not None
+    staging = _staging_dir(out_dir) if bedrock else None
     if not bedrock:
         out_dir.mkdir(parents=True)
+    try:
+        return _run(args, out_dir, staging, judge_region)
+    finally:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _run(args: argparse.Namespace, out_dir: Path, staging: Optional[Path], judge_region: Optional[str]) -> int:
+    bedrock = judge_region is not None
+    work_dir = staging if bedrock else out_dir
     judge_model = score_realism_llm.redact_account_ids(score_realism_llm.MODEL) if bedrock else score_realism_llm.MODEL
 
     characters = load_characters(args.characters) if args.characters else None
@@ -203,6 +233,7 @@ def main() -> int:
     if bedrock:
         n_skipped, n_pairs = score_realism_llm.pair_counts(realism_llm)
         print(f"judge: {n_skipped} of {n_pairs} pairs unjudged ({n_skipped / n_pairs:.1%}), counted as skipped")
+        print(f"judge: {realism_llm['usage']['n_dropped_verdicts']} verdict(s) for pairs outside their call dropped")
 
     results = {
         "config": {"predictions": str(args.predictions), "ground_truth": str(args.ground_truth),
@@ -215,12 +246,12 @@ def main() -> int:
         "native_join": diag,
         "detail": {"recall": recall, "consistency": consistency, "realism_rule": realism_rule, "judge": realism_llm, "grouping": grouping},
     }
-    if bedrock:
-        out_dir.mkdir(parents=True)
-    (out_dir / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
-    render(results, out_dir / "summary.md", out_dir / "viewer.html")
-    with open(out_dir / "summary.md", "a", encoding="utf-8") as f:
+    (work_dir / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
+    render(results, work_dir / "summary.md", work_dir / "viewer.html")
+    with open(work_dir / "summary.md", "a", encoding="utf-8") as f:
         f.write(render_by_kind(metrics["by_kind"], diag))
+    if bedrock:
+        _publish(staging, out_dir)
     print(f"\nwrote {out_dir / 'results.json'}\nwrote {out_dir / 'summary.md'}\nwrote {out_dir / 'viewer.html'}")
     return 0
 

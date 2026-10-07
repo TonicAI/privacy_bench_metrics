@@ -138,22 +138,64 @@ inference profile and the foundation models it routes to.
 
 A Bedrock judge call that fails with a throttling, overloaded, timeout, 5xx
 or connection error, including one raised partway through the response
-stream, is retried with exponential backoff and jitter. The SDK's own retries
-are turned off on this client, so the judge's loop is the only retry layer:
-each judge call (one per character, org-group chunk or unowned batch) sends
-at most 5 HTTP requests. Auth, validation and access-denied errors are not
-retried. Unlike the default provider, the Bedrock judge does not skip a
-call. The run exits non-zero without writing `results.json`, and without
-leaving a run directory behind, on missing credentials, a call that still
-fails, or a reply that does not parse, judges none of its pairs, or carries
-a malformed verdict for one of them (a `coherent` that is not a boolean, or
-`values` that is not a list of `{value, coherent}` entries). It does the same
-when every pair of the run is unjudged. A pair that an otherwise valid reply
-leaves out still counts as skipped (it stays in the synthesis-accuracy
-denominator); the run prints how many pairs went unjudged, and
-`results.json` keeps the counts. `config` records the provider, the model
-(an ARN's account id is redacted) and `judge_effort: "default"`, since no
-effort level is sent.
+stream, is retried. The SDK's own retries are turned off on this client, so
+the judge's loop is the only retry layer: each judge call (one per
+character, org-group chunk or unowned batch) sends at most 5 HTTP requests.
+Auth, validation and access-denied errors are not retried.
+
+- **Backoff.** The four waits are 8, 16, 32 and 64 s, each give or take 25%,
+  so a call that keeps being throttled waits 90 to 150 s in all, about the
+  two minutes the SDK's own retries used to allow. When the failed response
+  carries `retry-after-ms` or `retry-after` (seconds or an HTTP date), the
+  wait is at least that long, capped at 60 s, which makes the most a call
+  can wait 260 s. A failure elsewhere in the run ends any wait at once.
+- **Timeout.** The client's timeout is 300 s, with 10 s to connect, instead
+  of the SDK's 600 s: a gap of 300 s with no bytes ends the attempt. The
+  judge also ends an attempt whose stream is still going after 300 s, at its
+  next event. Both count as timeouts, so they are retried. A reply is at
+  most `MAX_TOKENS` (12,000) output tokens, adaptive thinking included,
+  whatever the owner's size; the largest chunk, 25 org-group pairs, needs
+  far fewer. With the default `display: "omitted"`, the thinking streams no
+  text, so the longest silent gap is the whole thinking phase. At a
+  conservative 40 output tokens a second, even a full-length reply at the
+  default effort streams in 300 s, so a healthy reply meets neither limit,
+  while a hung one costs 5 minutes rather than 10.
+- **Worst-case wall time per call.** One attempt takes at most about 610 s:
+  10 s to connect, a stream that runs up to its 300 s deadline, then 300 s of
+  silence before the read timeout. A stream that stalls outright ends after
+  about 310 s. So a call takes at most 5 × 610 + 260 s, about 55 minutes,
+  and a call that is only throttled takes 90 to 150 s of waiting, or up to
+  260 s with `retry-after`. The CI job's `timeout-minutes` still bounds the
+  whole run.
+
+Unlike the default provider, the Bedrock judge does not skip a call. The run
+exits non-zero, writing no `results.json` and leaving no run directory, on any
+of these:
+- missing credentials;
+- a call that still fails;
+- a reply that does not parse, judges none of its pairs, or carries a
+  malformed verdict for one of them (a `coherent` that is not a boolean, or
+  `values` that is not a list of `{value, coherent}` entries);
+- a run in which every pair is unjudged.
+
+Only a reply's verdicts for the call's own pairs are kept, so the tallies and
+the headline metrics read exactly the entries that were checked. A verdict
+for a pair the call did not show the judge, such as one from another chunk of
+the same org group, or one under a label the call did not ask about, is
+dropped. `usage.n_dropped_verdicts` counts these, and the run prints the
+count. A pair that an otherwise valid reply leaves out still counts as
+skipped, so it stays in the synthesis-accuracy denominator; the run prints
+how many pairs went unjudged, and `results.json` keeps the counts.
+
+The run is built in a hidden sibling of the run directory,
+`.<run-name>.partial-*`, which is created before any judge call. A
+`--runs-dir` that cannot hold it, or a run name that is already taken,
+therefore fails before anything is billed. The sibling is renamed to the run
+name only once `results.json`, `summary.md` and `viewer.html` are all
+written, and it is removed on any failure. If the name was taken meanwhile,
+the run exits non-zero rather than replace it. `config` records the provider,
+the model (with an ARN's account id redacted) and `judge_effort: "default"`,
+since no effort level is sent.
 
 Each gold span is matched to the predicted span of the same file unit that
 overlaps it most in native coordinates (at least half of the union) and carries
