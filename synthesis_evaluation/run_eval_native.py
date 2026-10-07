@@ -35,11 +35,12 @@ Bedrock instead, with credentials from the standard AWS chain:
 
 With bedrock, --judge-model is required, the region defaults to AWS_REGION, then AWS_DEFAULT_REGION, and
 AWS_BEARER_TOKEN_BEDROCK, when set, takes precedence over the AWS credential chain. A judge call that fails with
-a throttling, overloaded, 5xx or connection error, including partway through its stream, is retried with
-backoff, up to 5 attempts in all; auth, validation and access-denied errors are not retried. Missing credentials, a call that still
-fails, a reply that does not parse or judges none of its pairs, or a run with every pair unjudged exits non-zero
-without writing results.json. Pairs left out of an otherwise valid reply count as skipped, and the run prints
-how many.
+a throttling, overloaded, timeout, 5xx or connection error, including partway through its stream, is retried
+with backoff; the SDK's own retries are off, so a judge call sends at most 5 HTTP requests. Auth, validation
+and access-denied errors are not retried. Missing credentials, a call that still fails, a reply that does not
+parse, has a malformed verdict for one of its pairs or judges none of them, or a run with every pair unjudged
+exits non-zero; the run directory is created only once the judge has succeeded, so a failed run leaves none.
+Pairs left out of an otherwise valid reply count as skipped, and the run prints how many.
 """
 from __future__ import annotations
 
@@ -102,13 +103,6 @@ def render_by_kind(by_kind: Dict[str, dict], diag: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _remove_if_empty(path: Path) -> None:
-    try:
-        path.rmdir()
-    except OSError:
-        pass
-
-
 def resolve_judge(ap: argparse.ArgumentParser, args: argparse.Namespace) -> Optional[str]:
     """Validate the judge flags; returns the bedrock region (None for the anthropic provider).
     Exits through ``ap.error`` on an invalid combination."""
@@ -160,8 +154,9 @@ def main() -> int:
     out_dir = args.runs_dir / args.run_name
     if out_dir.exists():
         sys.exit(f"refusing to overwrite existing run dir: {out_dir}")
-    out_dir.mkdir(parents=True)
     bedrock = judge_region is not None
+    if not bedrock:
+        out_dir.mkdir(parents=True)
     judge_model = score_realism_llm.redact_account_ids(score_realism_llm.MODEL) if bedrock else score_realism_llm.MODEL
 
     characters = load_characters(args.characters) if args.characters else None
@@ -193,7 +188,6 @@ def main() -> int:
             realism_llm = score_realism_llm.score(rows, characters=characters, workers=args.workers,
                                                   provider=args.judge_provider, region=judge_region)
         except score_realism_llm.JudgeError as exc:
-            _remove_if_empty(out_dir)
             sys.exit(f"LLM judge failed, no results written: {exc}")
         timings["realism_llm"] = time.monotonic() - t
     t = time.monotonic()
@@ -221,6 +215,8 @@ def main() -> int:
         "native_join": diag,
         "detail": {"recall": recall, "consistency": consistency, "realism_rule": realism_rule, "judge": realism_llm, "grouping": grouping},
     }
+    if bedrock:
+        out_dir.mkdir(parents=True)
     (out_dir / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
     render(results, out_dir / "summary.md", out_dir / "viewer.html")
     with open(out_dir / "summary.md", "a", encoding="utf-8") as f:

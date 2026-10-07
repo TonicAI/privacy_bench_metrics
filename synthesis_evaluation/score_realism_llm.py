@@ -58,16 +58,19 @@ Two judge providers:
     fails or does not parse counts its buckets as skipped.
   - ``bedrock``: Amazon Bedrock through ``anthropic.AnthropicBedrock`` in an
     explicit region, authenticated by ``AWS_BEARER_TOKEN_BEDROCK`` when it is
-    set and otherwise by the standard AWS credential chain. Each call is
-    retried, up to JUDGE_ATTEMPTS attempts with exponential backoff and
-    jitter, when it fails with a throttling, overloaded, 5xx or connection
-    error, including one raised partway through the response stream; an auth,
-    validation or access-denied error is never retried. ``JudgeError`` is
-    raised, with no partial result, for missing credentials, nothing to
-    judge, a call that still fails, a response that does not parse, a
-    response that judges none of its pairs, or a run in which every pair is
-    unjudged. A pair that a valid response leaves out still counts as
-    skipped, as on the default provider; ``pair_counts`` reports how many.
+    set and otherwise by the standard AWS credential chain. The SDK's own
+    retries are off, so each judge call sends at most JUDGE_ATTEMPTS (5) HTTP
+    requests: it is retried with exponential backoff and jitter when it fails
+    with a throttling, overloaded, timeout, 5xx or connection error, including
+    one raised partway through the response stream; an auth, validation or
+    access-denied error is never retried. ``JudgeError`` is raised, with no
+    partial result, for missing credentials, nothing to judge, a call that
+    still fails, a response that does not parse, a response with a malformed
+    verdict for one of its pairs (no boolean ``coherent``, or a ``values``
+    that is not a list of ``{value, coherent}`` entries), a response that
+    judges none of its pairs, or a run in which every pair is unjudged. A
+    pair that a valid response leaves out still counts as skipped, as on the
+    default provider; ``pair_counts`` reports how many.
 """
 from __future__ import annotations
 
@@ -138,14 +141,14 @@ def bedrock_credentials_problem(region: Optional[str]) -> Optional[str]:
 def _make_client(provider: str, region: Optional[str]):
     import anthropic
     if provider == PROVIDER_BEDROCK:
-        return anthropic.AnthropicBedrock(aws_region=region, max_retries=MAX_RETRIES)
+        return anthropic.AnthropicBedrock(aws_region=region, max_retries=0)
     return anthropic.Anthropic(max_retries=MAX_RETRIES)
 
 
 _RETRYABLE_STREAM_ERRORS = frozenset({
-    "overloaded_error", "rate_limit_error", "api_error",
+    "overloaded_error", "rate_limit_error", "api_error", "timeout_error",
     "throttlingexception", "serviceunavailableexception", "internalserverexception",
-    "modelstreamerrorexception",
+    "modelstreamerrorexception", "modeltimeoutexception",
 })
 _CONNECTION_ERRORS = frozenset({"APIConnectionError", "TransportError"})
 _ERROR_CODE_RE = re.compile(r"[A-Za-z_]{1,64}")
@@ -160,11 +163,11 @@ def _stream_error_code(exc: BaseException) -> Optional[str]:
 
 
 def is_retryable(exc: BaseException) -> bool:
-    """Whether a failed judge call is worth retrying: throttling, overloaded, 5xx and connection errors are;
-    auth, validation, access-denied and every other error are not."""
+    """Whether a failed judge call is worth retrying: throttling, overloaded, timeout, 5xx and connection errors
+    are; auth, validation, access-denied and every other error are not."""
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and status != 200:
-        return status == 429 or status >= 500
+        return status in (408, 429) or status >= 500
     code = _stream_error_code(exc)
     if code is not None:
         return code.lower() in _RETRYABLE_STREAM_ERRORS
@@ -194,7 +197,11 @@ class _Cancelled(Exception):
 JUDGE_ATTEMPTS = 5
 RETRY_BASE_SEC = 2.0
 RETRY_CAP_SEC = 30.0
-_retry_sleep = time.sleep
+
+
+def _retry_sleep(stop: threading.Event, delay: float) -> bool:
+    """Back off for ``delay`` seconds; True when ``stop`` was set meanwhile, which ends the wait at once."""
+    return stop.wait(delay)
 
 
 def _call_llm_with_retries(client, system_prompt: str, user_msg: str,
@@ -210,8 +217,19 @@ def _call_llm_with_retries(client, system_prompt: str, user_msg: str,
             if attempt == JUDGE_ATTEMPTS or not is_retryable(exc):
                 raise _CallFailed(f"{describe_error(exc)} after {attempt} attempt(s)") from exc
             delay = min(RETRY_CAP_SEC, RETRY_BASE_SEC * 2 ** (attempt - 1))
-            _retry_sleep(delay / 2 + random.uniform(0, delay / 2))
+            if _retry_sleep(stop, delay / 2 + random.uniform(0, delay / 2)):
+                raise _Cancelled() from exc
     raise AssertionError("unreachable")
+
+
+def _guarded(stop: threading.Event, strict: bool, process, owner):
+    """Run one owner's judge calls unless the run already failed; a strict failure stops every later call."""
+    if stop.is_set():
+        return None
+    result = process(owner)
+    if strict and result is not None and result[2]:
+        stop.set()
+    return result
 
 # Character-level judging covers every label a character can own; ORGANIZATION
 # is judged per org GROUP, together with the addresses, phones, URLs and
@@ -814,19 +832,38 @@ def _has_verdicts(parsed: Optional[dict]) -> bool:
     return isinstance(parsed, dict) and isinstance(parsed.get("verdicts"), list)
 
 
-def _judged_pairs(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
-                  allowed: Tuple[str, ...], default_label: str) -> int:
-    """How many of ``mapping``'s (label, surface) pairs a parsed reply judges, matched the way the tallies match."""
+def _matching_verdicts(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
+                       allowed: Tuple[str, ...], default_label: str) -> List[Tuple[Tuple[str, str], dict]]:
+    """The reply's verdict entries that name one of ``mapping``'s (label, surface) pairs, matched the way the
+    tallies match."""
     verdicts = parsed.get("verdicts") if isinstance(parsed, dict) else None
     if not isinstance(verdicts, list):
-        return 0
-    pairs = set()
+        return []
+    out = []
     for entry in verdicts:
         if isinstance(entry, dict) and isinstance(entry.get("surface"), str):
             lab = _verdict_label(entry, default_label)
             if lab in allowed and entry["surface"] in (mapping.get(lab) or {}):
-                pairs.add((lab, entry["surface"]))
-    return len(pairs)
+                out.append(((lab, entry["surface"]), entry))
+    return out
+
+
+def _well_formed(entry: dict) -> bool:
+    """A verdict the tallies can read without coercion: a boolean ``coherent`` and, when present, a ``values``
+    list of ``{value: str, coherent: bool}`` entries."""
+    if not isinstance(entry.get("coherent"), bool):
+        return False
+    values = entry.get("values")
+    return values is None or (isinstance(values, list) and all(
+        isinstance(vv, dict) and isinstance(vv.get("value"), str) and isinstance(vv.get("coherent"), bool)
+        for vv in values))
+
+
+def _judged_pairs(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
+                  allowed: Tuple[str, ...], default_label: str) -> int:
+    """How many of ``mapping``'s pairs a parsed reply judges; ``_reply_problem`` has already failed any reply
+    whose verdict for one of them is not a boolean."""
+    return len({pair for pair, _ in _matching_verdicts(parsed, mapping, allowed, default_label)})
 
 
 def _n_pairs(mapping: Dict[str, Dict[str, List[str]]]) -> int:
@@ -848,6 +885,11 @@ def _reply_problem(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str
     """Why a bedrock reply cannot be used, or None; names counts only, never the pairs."""
     if not _has_verdicts(parsed):
         return "the response did not parse as a verdict list"
+    matching = _matching_verdicts(parsed, mapping, allowed, default_label)
+    malformed = sum(1 for _, entry in matching if not _well_formed(entry))
+    if malformed:
+        return (f"{malformed} of the response's {len(matching)} verdicts for its pairs are malformed "
+                f"(no boolean coherent, or values not a list of {{value, coherent}} entries)")
     if _judged_pairs(parsed, mapping, allowed, default_label) == 0:
         return f"the response judged none of its {_n_pairs(mapping)} pairs"
     return None
@@ -1014,14 +1056,6 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
                 return f"batch_{i}", None, problem, raw
         return f"batch_{i}", parsed, None, raw
 
-    def guarded(process, owner):
-        if stop.is_set():
-            return None
-        result = process(owner)
-        if strict and result is not None and result[2]:
-            stop.set()
-        return result
-
     char_index = {cid: i for i, cid in enumerate(chars)}
     org_index = {grp: i for i, grp in enumerate(org_groups)}
 
@@ -1041,9 +1075,9 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     failure: Optional[JudgeError] = None
     exe = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
-        char_futs = {exe.submit(guarded, process_one, cid): ("char", cid) for cid in chars}
-        org_futs = {exe.submit(guarded, process_org, grp): ("org", grp) for grp in org_groups}
-        un_futs = {exe.submit(guarded, process_unowned, i): ("unowned", i) for i in range(len(unowned_batches))}
+        char_futs = {exe.submit(_guarded, stop, strict, process_one, cid): ("char", cid) for cid in chars}
+        org_futs = {exe.submit(_guarded, stop, strict, process_org, grp): ("org", grp) for grp in org_groups}
+        un_futs = {exe.submit(_guarded, stop, strict, process_unowned, i): ("unowned", i) for i in range(len(unowned_batches))}
         all_futs = {**char_futs, **org_futs, **un_futs}
         for n, fut in enumerate(concurrent.futures.as_completed(all_futs), 1):
             kind, owner = all_futs[fut]
