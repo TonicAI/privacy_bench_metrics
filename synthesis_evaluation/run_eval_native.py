@@ -27,11 +27,21 @@ for that file; the only exclusion is the handful of PDF spans the renderer clipp
         --ground-truth $DATA/ground_truth/aaron_pfizer/ground_truth.jsonl \\
         --characters   $DATA/ground_truth/aaron_pfizer/characters.json \\
         --run-name     aaron_pfizer_my_pipeline [--judge-model claude-opus-5] [--skip-llm-judge]
+
+The judge runs on the Claude API by default (ANTHROPIC_API_KEY; skipped when unset). To run it on Amazon
+Bedrock instead, with credentials from the standard AWS chain:
+
+        --judge-provider bedrock --judge-model global.anthropic.claude-opus-5-5 [--judge-region us-east-1]
+
+With bedrock, --judge-model is required and the region defaults to AWS_REGION, then AWS_DEFAULT_REGION. The
+bedrock judge never skips: missing credentials, or a judge call that fails after retries, exit non-zero
+without writing results.json.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -88,6 +98,31 @@ def render_by_kind(by_kind: Dict[str, dict], diag: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _remove_if_empty(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def resolve_judge(ap: argparse.ArgumentParser, args: argparse.Namespace) -> Optional[str]:
+    """Validate the judge flags; returns the bedrock region (None for the anthropic provider).
+    Exits through ``ap.error`` on an invalid combination."""
+    if args.judge_provider != score_realism_llm.PROVIDER_BEDROCK:
+        if args.judge_region:
+            ap.error("--judge-region applies only to --judge-provider bedrock")
+        return None
+    if args.skip_llm_judge:
+        ap.error("--judge-provider bedrock requests the judge; it cannot be combined with --skip-llm-judge")
+    if not args.judge_model:
+        ap.error("--judge-model is required with --judge-provider bedrock "
+                 "(a Bedrock model or inference-profile id or ARN, e.g. global.anthropic.claude-opus-5-5)")
+    region = args.judge_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if not region:
+        ap.error("--judge-provider bedrock needs a region: pass --judge-region or set AWS_REGION / AWS_DEFAULT_REGION")
+    return region
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--predictions", required=True, type=Path, help="pipeline output JSONL: {file, spans[...]} per file unit")
@@ -96,10 +131,17 @@ def main() -> int:
     ap.add_argument("--run-name", required=True)
     ap.add_argument("--runs-dir", type=Path, default=RUNS_DIR)
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--judge-model", default=None, help=f"LLM judge model id (default {score_realism_llm.MODEL})")
+    ap.add_argument("--judge-provider", choices=score_realism_llm.PROVIDERS, default=score_realism_llm.PROVIDER_ANTHROPIC,
+                    help="where the LLM judge runs: the Claude API (default) or Amazon Bedrock")
+    ap.add_argument("--judge-model", default=None,
+                    help=f"LLM judge model id (default {score_realism_llm.MODEL}); required with --judge-provider bedrock, "
+                         "where it is a Bedrock model or inference-profile id or ARN")
+    ap.add_argument("--judge-region", default=None,
+                    help="AWS region for --judge-provider bedrock (default AWS_REGION, then AWS_DEFAULT_REGION)")
     ap.add_argument("--skip-llm-judge", action="store_true", help="NER recall only (offline, no API key)")
     ap.add_argument("--overlap", type=float, default=native.MATCH_THRESHOLD, help="minimum native-coordinate overlap for a match")
     args = ap.parse_args()
+    judge_region = resolve_judge(ap, args)
     if args.judge_model:
         score_realism_llm.MODEL = args.judge_model
     for p in (args.predictions, args.ground_truth):
@@ -107,10 +149,15 @@ def main() -> int:
             sys.exit(f"missing file: {p}")
     if not args.skip_llm_judge and not args.characters:
         sys.exit("--characters is required for synthesis accuracy; pass --skip-llm-judge for recall only")
+    if judge_region is not None:
+        problem = score_realism_llm.bedrock_credentials_problem(judge_region)
+        if problem:
+            sys.exit(f"bedrock judge unavailable: {problem}")
     out_dir = args.runs_dir / args.run_name
     if out_dir.exists():
         sys.exit(f"refusing to overwrite existing run dir: {out_dir}")
     out_dir.mkdir(parents=True)
+    judge_model = score_realism_llm.redact_account_ids(score_realism_llm.MODEL)
 
     characters = load_characters(args.characters) if args.characters else None
     print(f"loading predictions from {args.predictions} ...")
@@ -135,9 +182,14 @@ def main() -> int:
     if args.skip_llm_judge:
         realism_llm = {"skipped_reason": "--skip-llm-judge", "per_character": {}, "overall": {"coherent": 0, "incoherent": 0, "skipped": 0}}
     else:
-        print(f"LLM judge ({score_realism_llm.MODEL}) ...")
+        print(f"LLM judge ({args.judge_provider}: {judge_model}) ...")
         t = time.monotonic()
-        realism_llm = score_realism_llm.score(rows, characters=characters, workers=args.workers)
+        try:
+            realism_llm = score_realism_llm.score(rows, characters=characters, workers=args.workers,
+                                                  provider=args.judge_provider, region=judge_region)
+        except score_realism_llm.JudgeError as exc:
+            _remove_if_empty(out_dir)
+            sys.exit(f"LLM judge failed, no results written: {exc}")
         timings["realism_llm"] = time.monotonic() - t
     t = time.monotonic()
     grouping = score_grouping.score(rows)
@@ -153,7 +205,9 @@ def main() -> int:
     results = {
         "config": {"predictions": str(args.predictions), "ground_truth": str(args.ground_truth),
                    "characters": str(args.characters) if args.characters else None, "run_name": args.run_name,
-                   "format": "native", "overlap_threshold": args.overlap, "judge_model": None if args.skip_llm_judge else score_realism_llm.MODEL,
+                   "format": "native", "overlap_threshold": args.overlap,
+                   "judge_provider": None if args.skip_llm_judge else args.judge_provider,
+                   "judge_model": None if args.skip_llm_judge else judge_model,
                    "n_rows": len(rows), "tier": "entity", "labels": list(LABELS)},
         "timings_sec": timings,
         "metrics": metrics,

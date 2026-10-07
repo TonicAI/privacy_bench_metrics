@@ -51,6 +51,15 @@ the synthesis-accuracy denominator unjudged.
 
 Concurrent via ThreadPoolExecutor (default 8 workers). Prompt cache on the
 system prompt. JSON parse with regex fallback.
+
+Two judge providers:
+  - ``anthropic`` (the default): the direct Claude API, keyed by
+    ANTHROPIC_API_KEY. Without the key the judge is skipped, and a call that
+    fails or does not parse counts its buckets as skipped.
+  - ``bedrock``: Amazon Bedrock through ``anthropic.AnthropicBedrock``, with
+    credentials from the standard AWS chain and an explicit region. This judge
+    never skips: missing credentials, nothing to judge, a call that still fails
+    after retries, or a response that does not parse raises ``JudgeError``.
 """
 from __future__ import annotations
 
@@ -68,7 +77,60 @@ from .types import EvalRow, LABELS, ORG_LABELS, PERSON_LABELS
 
 MODEL = "claude-opus-4-7"
 MAX_TOKENS = 12_000          # adaptive thinking shares this budget with the verdict list
+MAX_RETRIES = 6
 PROGRESS_EVERY = 8
+
+PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_BEDROCK = "bedrock"
+PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_BEDROCK)
+
+
+class JudgeError(RuntimeError):
+    """The bedrock judge could not produce a complete result."""
+
+
+_ARN_ACCOUNT_RE = re.compile(r"(arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:)\d{12}(?=:)")
+
+
+def redact_account_ids(text: str) -> str:
+    """``text`` with the account id of every AWS ARN in it replaced, so a model id or an error message is safe
+    to record: an ARN keeps its service, region and resource."""
+    return _ARN_ACCOUNT_RE.sub(r"\1<account>", str(text))
+
+
+def bedrock_credentials_problem(region: Optional[str]) -> Optional[str]:
+    """Why the bedrock judge cannot sign requests, or None when it can.
+
+    Resolves credentials the way ``AnthropicBedrock`` does (a Bedrock bearer
+    token, else the boto3 credential chain) without sending a request."""
+    if not region:
+        return "no AWS region: pass --judge-region or set AWS_REGION / AWS_DEFAULT_REGION"
+    try:
+        import anthropic
+    except ImportError:
+        return "the anthropic package is not installed: pip install 'anthropic[bedrock]'"
+    if not hasattr(anthropic, "AnthropicBedrock"):
+        return "this anthropic package has no AnthropicBedrock client: pip install -U 'anthropic[bedrock]'"
+    if os.environ.get("AWS_BEARER_TOKEN_BEDROCK"):
+        return None
+    try:
+        import boto3
+    except ImportError:
+        return "boto3 is not installed: pip install 'anthropic[bedrock]'"
+    try:
+        credentials = boto3.Session(region_name=region).get_credentials()
+    except Exception as exc:
+        return f"could not resolve AWS credentials ({type(exc).__name__})"
+    if credentials is None:
+        return "no AWS credentials found in the standard AWS credential chain"
+    return None
+
+
+def _make_client(provider: str, region: Optional[str]):
+    import anthropic
+    if provider == PROVIDER_BEDROCK:
+        return anthropic.AnthropicBedrock(aws_region=region, max_retries=MAX_RETRIES)
+    return anthropic.Anthropic(max_retries=MAX_RETRIES)
 
 # Character-level judging covers every label a character can own; ORGANIZATION
 # is judged per org GROUP, together with the addresses, phones, URLs and
@@ -667,8 +729,13 @@ def _tally(mapping: Dict[str, Dict[str, List[str]]], counts: Dict[str, Dict[str,
                 })
 
 
+def _has_verdicts(parsed: Optional[dict]) -> bool:
+    return isinstance(parsed, dict) and isinstance(parsed.get("verdicts"), list)
+
+
 def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
-          workers: int = 8) -> dict:
+          workers: int = 8, provider: str = PROVIDER_ANTHROPIC,
+          region: Optional[str] = None) -> dict:
     """Run the LLM judge over every owner with synth data: one call per
     character (one verdict per (label, surface) pair over everything the
     character owns) and one call per organization group (one verdict per
@@ -678,8 +745,19 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     character's employer organization + its synthetic mapping into the
     character prompt so the judge can check email-domain ↔ synthetic-org
     consistency.
+
+    ``provider`` is ``"anthropic"`` (the direct API) or ``"bedrock"``
+    (``AnthropicBedrock`` in ``region``). The bedrock judge raises
+    ``JudgeError`` instead of returning a skipped or partial result.
     """
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown judge provider: {provider!r}")
+    strict = provider == PROVIDER_BEDROCK
+    if strict:
+        problem = bedrock_credentials_problem(region)
+        if problem:
+            raise JudgeError(problem)
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
         return {
             "skipped_reason": "ANTHROPIC_API_KEY not set",
             "per_character": {},
@@ -693,6 +771,8 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     chars = sorted(mappings)
     org_groups = sorted(org_mappings)
     if not chars and not org_groups and not unowned_batches:
+        if strict:
+            raise JudgeError("nothing to judge: no detected span carries a synthetic value")
         return {
             "skipped_reason": "no characters with synthetic values",
             "per_character": {},
@@ -700,8 +780,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             "per_label_span_totals": {},
         }
 
-    import anthropic
-    client = anthropic.Anthropic(max_retries=6)
+    client = _make_client(provider, region)
 
     metrics_lock = threading.Lock()
     totals = {"input_tokens": 0, "output_tokens": 0,
@@ -754,18 +833,25 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         verdicts: List[dict] = []
         raws: List[str] = []
         first_error: Optional[str] = None
-        for piece in chunks:
+        for n_chunk, piece in enumerate(chunks):
             user_msg = _build_org_user_message(grp, piece)
             try:
                 raw, usage = _call_llm(client, ORG_SYSTEM_PROMPT, user_msg)
             except Exception as exc:
                 first_error = first_error or f"{type(exc).__name__}: {exc}"
+                if strict:
+                    break
                 continue
             parsed = _parse_response(raw)
             _record(usage, parsed)
             raws.append(raw)
             if parsed and isinstance(parsed.get("verdicts"), list):
                 verdicts.extend(parsed["verdicts"])
+            elif strict:
+                first_error = f"chunk {n_chunk + 1}/{len(chunks)} did not parse"
+                break
+        if strict and first_error:
+            return grp, None, first_error, "\n".join(raws)
         if not verdicts:
             return grp, None, first_error or "no chunk parsed", "\n".join(raws)
         return grp, {"verdicts": verdicts}, None, "\n".join(raws)
@@ -794,6 +880,11 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         for n, fut in enumerate(concurrent.futures.as_completed(all_futs), 1):
             kind, _ = all_futs[fut]
             key, parsed, err, raw = fut.result()
+            if strict and (err or not _has_verdicts(parsed)):
+                exe.shutdown(wait=False, cancel_futures=True)
+                raise JudgeError(redact_account_ids(
+                    f"{provider} judge call for {kind} {key!r} failed: "
+                    f"{err or 'the response did not parse as a verdict list'}"))
             if kind == "unowned":
                 per_unowned[key] = {"mapping": unowned_batches[int(key.split("_")[1])], "raw": raw, "parsed": parsed, "error": err}
             elif kind == "char":
@@ -878,7 +969,8 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
                              for k in ("coherent_spans", "incoherent_spans", "skipped_spans")}
 
     return {
-        "model": MODEL,
+        "provider": provider,
+        "model": redact_account_ids(MODEL),
         "usage": {
             "n_calls":          totals["n_calls"],
             "n_parse_failures": totals["n_parse_failures"],
