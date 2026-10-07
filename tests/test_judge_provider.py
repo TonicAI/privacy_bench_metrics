@@ -16,6 +16,7 @@ import email.utils
 import io
 import json
 import os
+import signal
 import struct
 import sys
 import tempfile
@@ -60,9 +61,17 @@ class _Message:
         self.usage = _Usage()
 
 
+class _Response:
+    def iter_bytes(self):
+        yield from (b"message_start", b"message_stop")
+
+
 class _Stream:
+    """Shaped like the SDK's MessageStream: its events are decoded from ``response.iter_bytes()``."""
+
     def __init__(self, reply):
         self._reply = reply
+        self.response = _Response()
 
     def __enter__(self):
         return self
@@ -73,7 +82,12 @@ class _Stream:
     def __iter__(self):
         if isinstance(self._reply, Exception):
             raise self._reply
-        yield from ("message_start", "message_stop")
+        for chunk in self.response.iter_bytes():
+            yield types.SimpleNamespace(type=chunk.decode())
+
+    @property
+    def current_message_snapshot(self):
+        return _Message(self._reply)
 
     def get_final_message(self):
         if isinstance(self._reply, Exception):
@@ -602,8 +616,43 @@ class BedrockRetryTests(JudgeCliTestCase):
         [call] = self.sleep.call_args_list
         self.assertGreaterEqual(call.args[1], 50)
 
+    def delay(self, attempt, headers):
+        return score_realism_llm._retry_delay(attempt, FakeStatusError(429, headers=headers))
+
+    def test_a_hint_shorter_than_the_backoff_does_not_shorten_it(self):
+        for attempt, nominal in zip(range(1, score_realism_llm.JUDGE_ATTEMPTS), (8, 16, 32, 64)):
+            with self.subTest(attempt=attempt):
+                self.assertGreaterEqual(self.delay(attempt, {"retry-after": "1"}), nominal * 0.75)
+                self.assertGreaterEqual(self.delay(attempt, {"retry-after-ms": "500"}), nominal * 0.75)
+
+    def test_retry_after_ms_is_in_milliseconds_and_takes_precedence(self):
+        self.assertEqual(self.delay(1, {"retry-after-ms": "25000"}), 25)
+        self.assertEqual(self.delay(1, {"retry-after-ms": "25000", "retry-after": "50"}), 25)
+        self.assertEqual(self.delay(1, {"retry-after": "25", "retry-after-ms": "50000"}), 50)
+
+    def test_an_infinite_hint_is_ignored(self):
+        for value in ("inf", "-inf", "Infinity"):
+            with self.subTest(value=value):
+                self.assertLessEqual(self.delay(1, {"retry-after": value}), 10)
+
+    def test_a_zoneless_http_date_is_read_as_utc(self):
+        when = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(seconds=40)
+        header = email.utils.format_datetime(when)
+        self.assertTrue(header.endswith("-0000"), header)
+        self.addCleanup(time.tzset)
+        with mock.patch.dict(os.environ, {"TZ": "EST+05"}):
+            time.tzset()
+            delay = self.delay(1, {"retry-after": header})
+        self.assertGreaterEqual(delay, 35)
+        self.assertLessEqual(delay, 41)
+
+    def test_the_jitter_spreads_both_ways(self):
+        with mock.patch.object(score_realism_llm.random, "uniform", return_value=1.0) as uniform:
+            self.assertEqual(self.delay(2, {}), 16)
+        uniform.assert_called_once_with(0.75, 1.25)
+
     def test_an_attempt_past_its_deadline_is_retried_then_fails(self):
-        with mock.patch.object(score_realism_llm, "ATTEMPT_TIMEOUT_SEC", -1.0):
+        with mock.patch.object(score_realism_llm, "STREAM_DEADLINE_SEC", -1.0):
             code, _, err, requests = self.run_with(json.dumps(GOOD_VERDICTS))
         self.assertNotEqual(code, 0)
         self.assertIn("character 1 of 1 failed: AttemptTimeout after 5 attempt(s)", err)
@@ -748,6 +797,13 @@ class BedrockOutOfScopeVerdictTests(JudgeCliTestCase):
         results, out = self.run_chunks(chunk_1, [_org_entry(s) for s in CHUNK_2[:-1]])
         self.assert_scored(results, out, coherent=31, incoherent=0, skipped=1)
 
+    def test_an_org_verdict_without_a_label_is_an_organization_verdict(self):
+        def unlabelled(surfaces):
+            return [{k: v for k, v in _org_entry(s).items() if k != "label"} for s in surfaces]
+        results, out = self.run_chunks(unlabelled(CHUNK_1), unlabelled(CHUNK_2))
+        self.assert_scored(results, out, coherent=32, incoherent=0, skipped=0, dropped=0)
+        self.assertEqual(len(results["detail"]["judge"]["per_org_group"][ORG_GROUP]["parsed"]["verdicts"]), 30)
+
 
 class BedrockUnownedTests(JudgeCliTestCase):
     """R-19: an unowned batch's reply is checked like any other owner's."""
@@ -827,6 +883,130 @@ class BedrockRunDirTests(JudgeCliTestCase):
         self.assertIn("refusing to overwrite existing run dir", err)
         self.assertEqual(sorted(p.name for p in self.paths["runs"].iterdir()), ["run"])
         self.assertEqual(sorted(p.name for p in self.run_dir().iterdir()), ["theirs"])
+
+    def run_taken_meanwhile(self, take):
+        def reply(_kwargs):
+            take(self.run_dir())
+            return json.dumps(GOOD_VERDICTS)
+        code, _, err, _ = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
+        self.assertNotEqual(code, 0)
+        self.assertIn(f"refusing to overwrite existing run dir: {self.run_dir()}", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(sorted(p.name for p in self.paths["runs"].iterdir()), ["run"])
+
+    def test_an_empty_dir_created_meanwhile_is_not_replaced(self):
+        self.run_taken_meanwhile(lambda path: path.mkdir(exist_ok=True))
+        self.assertEqual(list(self.run_dir().iterdir()), [])
+
+    def test_a_file_created_meanwhile_is_not_replaced(self):
+        self.run_taken_meanwhile(lambda path: path.write_text("theirs"))
+        self.assertEqual(self.run_dir().read_text(), "theirs")
+
+    def test_a_failed_rename_releases_the_claimed_name(self):
+        with mock.patch.object(run_eval_native.os, "rename", side_effect=OSError(39, "Directory not empty")):
+            code, _, err, _ = self.run_main(*BEDROCK)
+        self.assertNotEqual(code, 0)
+        self.assertIn("refusing to overwrite existing run dir", err)
+        self.assert_nothing_written()
+
+    def test_the_name_cannot_be_taken_while_the_run_is_renamed_into_it(self):
+        rename = os.rename
+        racer = []
+
+        def racing_rename(src, dst):
+            try:
+                Path(dst).mkdir()
+                racer.append("took the name")
+            except FileExistsError:
+                racer.append("refused")
+            return rename(src, dst)
+        with mock.patch.object(run_eval_native.os, "rename", racing_rename):
+            code, _, err, _ = self.run_main(*BEDROCK)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(racer, ["refused"])
+        self.assertTrue(any(self.run_dir().iterdir()))
+
+    def test_the_run_is_built_in_a_hidden_sibling(self):
+        seen = []
+
+        def reply(_kwargs):
+            seen.extend(p.name for p in self.paths["runs"].iterdir())
+            return json.dumps(GOOD_VERDICTS)
+        code, _, err, _ = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
+        self.assertEqual(code, 0, err)
+        self.assertTrue(seen)
+        self.assertTrue(all(name.startswith(".run.partial-") for name in seen), seen)
+        self.assertEqual(sorted(p.name for p in self.paths["runs"].iterdir()), ["run"])
+
+    def test_the_run_dir_mode_matches_the_default_provider(self):
+        previous = os.umask(0o027)
+        self.addCleanup(os.umask, previous)
+        code, _, err, _ = self.run_main(*BEDROCK)
+        self.assertEqual(code, 0, err)
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        code, _, err, _ = self.run_main(name="default")
+        self.assertEqual(code, 0, err)
+        modes = [self.run_dir(name).stat().st_mode & 0o777 for name in ("run", "default")]
+        self.assertEqual(modes, [0o750, 0o750])
+
+
+class _Terminated(Exception):
+    """Raised by the test's own SIGTERM handler, which the run must replace while it runs."""
+
+
+def _test_sigterm_handler(_signum, _frame):
+    raise _Terminated()
+
+
+@unittest.skipUnless(hasattr(signal, "SIGTERM") and os.name == "posix", "needs POSIX signals")
+class BedrockSigtermTests(JudgeCliTestCase):
+    """R-21: SIGTERM partway through a bedrock run unwinds it: queued calls are cancelled, the staging dir is
+    removed, the run exits 143, and the caller's SIGTERM handler is restored."""
+
+    org_surfaces = 30
+
+    def setUp(self):
+        super().setUp()
+        previous = signal.signal(signal.SIGTERM, _test_sigterm_handler)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+
+    def test_sigterm_removes_the_staging_dir_and_stops_the_run(self):
+        shutdown_called = threading.Event()
+
+        class SpyExecutor(concurrent.futures.ThreadPoolExecutor):
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                shutdown_called.set()
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+        def reply(kwargs):
+            if _is_org_call(kwargs):
+                os.kill(os.getpid(), signal.SIGTERM)
+                shutdown_called.wait(timeout=5)
+                return _org_verdict("Acme00")
+            return json.dumps(GOOD_VERDICTS)
+
+        module = _fake_anthropic(bedrock_reply=reply)
+        with mock.patch.object(concurrent.futures, "ThreadPoolExecutor", SpyExecutor):
+            code, _, _, _ = self.run_main(*BEDROCK, "--workers", "1", anthropic_module=module)
+            for thread in threading.enumerate():
+                if thread.name.startswith("ThreadPoolExecutor"):
+                    thread.join(timeout=5)
+        self.assertEqual(code, 143)
+        self.assert_nothing_written()
+        self.assertEqual(sum(_is_org_call(r) for r in module.AnthropicBedrock.instances[0].requests), 1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), _test_sigterm_handler)
+
+    def test_the_default_provider_leaves_sigterm_alone(self):
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        handlers = []
+
+        def reply(_kwargs):
+            handlers.append(signal.getsignal(signal.SIGTERM))
+            return json.dumps(GOOD_VERDICTS)
+        code, _, err, _ = self.run_main(anthropic_module=_fake_anthropic(reply=reply))
+        self.assertEqual(code, 0, err)
+        self.assertTrue(handlers)
+        self.assertTrue(all(h is _test_sigterm_handler for h in handlers))
 
 
 class BedrockCancellationTests(JudgeCliTestCase):
@@ -911,6 +1091,68 @@ class BedrockCancellationTests(JudgeCliTestCase):
         self.assertFalse(any(not _is_org_call(r) and not _is_unowned_call(r) for r in requests))
         self.assert_nothing_written()
 
+    def test_an_interrupt_cancels_queued_calls(self):
+        """R-22: as above, with a KeyboardInterrupt raised in the main thread while the org chunk is in flight."""
+        org_started, shutdown_called = threading.Event(), threading.Event()
+        shutdowns = []
+
+        class SpyExecutor(concurrent.futures.ThreadPoolExecutor):
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                shutdowns.append({"wait": wait, "cancel_futures": cancel_futures})
+                shutdown_called.set()
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+        def reply(kwargs):
+            if _is_org_call(kwargs):
+                org_started.set()
+                shutdown_called.wait(timeout=5)
+                return _org_verdict("Acme00")
+            return UNOWNED_GOOD if _is_unowned_call(kwargs) else json.dumps(GOOD_VERDICTS)
+
+        def interrupted(_futures):
+            org_started.wait(timeout=5)
+            raise KeyboardInterrupt()
+            yield
+
+        module = _fake_anthropic(bedrock_reply=reply)
+        with mock.patch.object(concurrent.futures, "ThreadPoolExecutor", SpyExecutor), \
+                mock.patch.object(concurrent.futures, "as_completed", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_main(*BEDROCK, "--workers", "2", anthropic_module=module)
+            for thread in threading.enumerate():
+                if thread.name.startswith("ThreadPoolExecutor"):
+                    thread.join(timeout=5)
+        self.assertTrue(org_started.is_set())
+        self.assertEqual(shutdowns, [{"wait": False, "cancel_futures": True}])
+        requests = module.AnthropicBedrock.instances[0].requests
+        self.assertEqual(sum(_is_org_call(r) for r in requests), 1)
+        self.assert_nothing_written()
+
+    def test_a_default_provider_worker_error_still_runs_the_queue(self):
+        """R-22: on the default provider an unexpected worker error stops nothing, as at 08cf2b4."""
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        shutdowns = []
+
+        class SpyExecutor(concurrent.futures.ThreadPoolExecutor):
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                shutdowns.append({"wait": wait, "cancel_futures": cancel_futures})
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+        def reply(kwargs):
+            if _is_org_call(kwargs):
+                return _org_verdict("Acme00")
+            return UNOWNED_GOOD
+
+        module = _fake_anthropic(reply=reply)
+        with mock.patch.object(concurrent.futures, "ThreadPoolExecutor", SpyExecutor), \
+                mock.patch.object(score_realism_llm, "_build_user_message", side_effect=TypeError("roster")):
+            with self.assertRaises(TypeError):
+                self.run_main("--workers", "1", anthropic_module=module)
+        self.assertEqual(shutdowns, [{"wait": True, "cancel_futures": False}])
+        requests = module.Anthropic.instances[0].requests
+        self.assertEqual(([_is_org_call(r) for r in requests], [_is_unowned_call(r) for r in requests]),
+                         ([True, True, False], [False, False, True]))
+
 
 class GuardedTests(unittest.TestCase):
     def test_skips_the_owner_once_the_run_has_failed(self):
@@ -959,6 +1201,51 @@ class RetryLoopTests(unittest.TestCase):
         self.assertEqual(len(client.requests), 1)
 
 
+class StreamDeadlineTests(unittest.TestCase):
+    """R-20: the whole-stream deadline stops reads of the body, never a reply that has finished."""
+
+    def stream(self, *chunks, gap=0.0):
+        class Response:
+            def iter_bytes(self):
+                for chunk in chunks:
+                    yield chunk
+                    time.sleep(gap)
+        stream = _Stream("ok")
+        stream.response = Response()
+        return stream
+
+    def test_the_deadline_leaves_room_for_a_full_reply(self):
+        self.assertGreaterEqual(score_realism_llm.STREAM_DEADLINE_SEC, score_realism_llm.MAX_TOKENS / 15 + 60)
+        self.assertGreater(score_realism_llm.STREAM_DEADLINE_SEC, 2 * score_realism_llm.READ_TIMEOUT_SEC)
+
+    def test_no_read_starts_after_the_deadline(self):
+        reads = []
+
+        def chunks():
+            for i in range(3):
+                reads.append(i)
+                yield bytes([i])
+        deadline = time.monotonic() + 60
+        body = score_realism_llm._reads_before(chunks(), deadline)
+        self.assertEqual(next(body), b"\x00")
+        with mock.patch.object(score_realism_llm.time, "monotonic", return_value=deadline + 1):
+            with self.assertRaises(score_realism_llm.AttemptTimeout):
+                next(body)
+        self.assertEqual(reads, [0])
+
+    def test_a_finished_reply_is_kept_past_the_deadline(self):
+        stream = self.stream(b"message_start", b"message_stop", b"never_read", gap=0.05)
+        message = score_realism_llm._final_message_by(stream, time.monotonic() + 0.02)
+        self.assertEqual(message.content[0].text, "ok")
+
+    def test_an_unfinished_reply_ends_at_the_deadline(self):
+        stream = self.stream(b"message_start", *([b"content_block_delta"] * 100), gap=0.01)
+        start = time.monotonic()
+        with self.assertRaises(score_realism_llm.AttemptTimeout):
+            score_realism_llm._final_message_by(stream, start + 0.05)
+        self.assertLess(time.monotonic() - start, 0.5)
+
+
 def _real_sdk():
     try:
         import anthropic
@@ -978,6 +1265,10 @@ def _frame(headers: dict, payload: bytes) -> bytes:
 
 
 def _event_stream(text: str) -> bytes:
+    return b"".join(_event_stream_frames(text))
+
+
+def _event_stream_frames(text: str) -> list:
     events = [
         {"type": "message_start", "message": {"id": "m", "type": "message", "role": "assistant", "model": "x",
                                               "content": [], "stop_reason": None, "stop_sequence": None,
@@ -989,8 +1280,8 @@ def _event_stream(text: str) -> bytes:
          "usage": {"output_tokens": 3}},
         {"type": "message_stop"}]
     headers = {":event-type": "chunk", ":content-type": "application/json", ":message-type": "event"}
-    return b"".join(_frame(headers, json.dumps({"bytes": base64.b64encode(json.dumps(e).encode()).decode()}).encode())
-                    for e in events)
+    return [_frame(headers, json.dumps({"bytes": base64.b64encode(json.dumps(e).encode()).decode()}).encode())
+            for e in events]
 
 
 @unittest.skipUnless(_real_sdk(), "needs anthropic[bedrock] installed")
@@ -1051,12 +1342,43 @@ class RealSdkRequestCountTests(unittest.TestCase):
         raw, usage = score_realism_llm._call_llm_with_retries(client, "system", "user", threading.Event())
         self.assertEqual((raw, usage["output_tokens"], len(requests)), ("ok", 3, 1))
 
-    def test_a_streamed_reply_past_its_deadline(self):
+    def streamed(self, chunks):
         import httpx2
-        with mock.patch.object(score_realism_llm, "ATTEMPT_TIMEOUT_SEC", -1.0):
-            self.assertEqual(self.count_requests(lambda r: httpx2.Response(
-                200, headers={"content-type": "application/vnd.amazon.eventstream"}, content=_event_stream("ok"))),
-                score_realism_llm.JUDGE_ATTEMPTS)
+        return lambda r: httpx2.Response(200, headers={"content-type": "application/vnd.amazon.eventstream"},
+                                         content=chunks())
+
+    def test_a_complete_reply_arriving_past_the_deadline_is_kept(self):
+        """R-20: the read that brings ``message_stop`` began before the deadline, so the finished reply is kept."""
+        frames = _event_stream_frames("ok")
+
+        def chunks():
+            yield from frames[:-1]
+            time.sleep(1.2)
+            yield frames[-1]
+        requests = []
+        client = self.client(self.streamed(chunks), requests)
+        with mock.patch.object(score_realism_llm, "STREAM_DEADLINE_SEC", 1.0):
+            raw, usage = score_realism_llm._call_llm_with_retries(client, "system", "user", threading.Event())
+        self.assertEqual((raw, usage["output_tokens"], len(requests)), ("ok", 3, 1))
+
+    def test_a_reply_that_never_completes_is_ended_at_the_deadline(self):
+        """R-20: bytes that keep arriving without completing an event do not extend the attempt."""
+        frames = _event_stream_frames("ok")
+
+        def chunks():
+            yield frames[0]
+            for byte in frames[1][:-1]:
+                time.sleep(0.02)
+                yield bytes([byte])
+        start = time.monotonic()
+        with mock.patch.object(score_realism_llm, "STREAM_DEADLINE_SEC", 0.1):
+            self.assertEqual(self.count_requests(self.streamed(chunks)), score_realism_llm.JUDGE_ATTEMPTS)
+        self.assertLess(time.monotonic() - start, 0.5 * score_realism_llm.JUDGE_ATTEMPTS)
+
+    def test_a_reply_past_its_deadline_before_any_read_is_retried(self):
+        with mock.patch.object(score_realism_llm, "STREAM_DEADLINE_SEC", -1.0):
+            self.assertEqual(self.count_requests(self.streamed(lambda: iter(_event_stream_frames("ok")))),
+                             score_realism_llm.JUDGE_ATTEMPTS)
 
     def test_sustained_throttling(self):
         import httpx2
@@ -1156,6 +1478,16 @@ class AnthropicDefaultTests(JudgeCliTestCase):
         self.assertNotIn("pairs unjudged", out)
         self.assertNotIn("dropped", out)
         self.assertNotIn("n_dropped_verdicts", results["detail"]["judge"]["usage"])
+
+    def test_verdicts_outside_the_call_are_kept(self):
+        """R-22: the default provider stores a reply's verdicts as they came, as at 08cf2b4."""
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        extra = {"label": "NAME_GIVEN", "surface": "Zed", "coherent": False, "values": []}
+        verdicts = GOOD_VERDICTS["verdicts"] + [extra]
+        code, out, err, _ = self.run_main(anthropic_module=_fake_anthropic(reply=json.dumps({"verdicts": verdicts})))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.results()["detail"]["judge"]["per_character"]["c1"]["parsed"], {"verdicts": verdicts})
+        self.assertNotIn("dropped", out)
 
     def test_failing_call_still_counts_as_skipped(self):
         os.environ["ANTHROPIC_API_KEY"] = "fake"

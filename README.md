@@ -149,24 +149,38 @@ Auth, validation and access-denied errors are not retried.
   carries `retry-after-ms` or `retry-after` (seconds or an HTTP date), the
   wait is at least that long, capped at 60 s, which makes the most a call
   can wait 260 s. A failure elsewhere in the run ends any wait at once.
-- **Timeout.** The client's timeout is 300 s, with 10 s to connect, instead
-  of the SDK's 600 s: a gap of 300 s with no bytes ends the attempt. The
-  judge also ends an attempt whose stream is still going after 300 s, at its
-  next event. Both count as timeouts, so they are retried. A reply is at
-  most `MAX_TOKENS` (12,000) output tokens, adaptive thinking included,
-  whatever the owner's size; the largest chunk, 25 org-group pairs, needs
-  far fewer. With the default `display: "omitted"`, the thinking streams no
-  text, so the longest silent gap is the whole thinking phase. At a
-  conservative 40 output tokens a second, even a full-length reply at the
-  default effort streams in 300 s, so a healthy reply meets neither limit,
-  while a hung one costs 5 minutes rather than 10.
-- **Worst-case wall time per call.** One attempt takes at most about 610 s:
-  10 s to connect, a stream that runs up to its 300 s deadline, then 300 s of
-  silence before the read timeout. A stream that stalls outright ends after
-  about 310 s. So a call takes at most 5 × 610 + 260 s, about 55 minutes,
-  and a call that is only throttled takes 90 to 150 s of waiting, or up to
-  260 s with `retry-after`. The CI job's `timeout-minutes` still bounds the
-  whole run.
+- **Timeouts.** An attempt has two separate limits, and either one ends it
+  as a timeout, which is retried.
+  - *Idle read: 300 s.* The client's timeout is 300 s per read, with 10 s to
+    connect, instead of the SDK's 600 s, so 300 s with no bytes ends the
+    attempt. With the default `display: "omitted"`, the thinking streams no
+    text, so the longest silent gap can be the whole thinking phase. At a
+    conservative 40 output tokens a second, 300 s is 12,000 tokens of
+    thinking, the whole `MAX_TOKENS` budget. An idle limit alone cannot end
+    an attempt that keeps receiving bytes, and a hung stream can keep
+    sending keepalives indefinitely.
+  - *Whole stream: 900 s.* No read of the response starts once 900 s have
+    passed since the attempt began. The check runs before every read of
+    the body, not per event, so bytes or keepalives that never complete an
+    event cannot extend it. A reply whose `message_stop` event has arrived
+    is kept however late it is, so a finished reply is never thrown away.
+    A reply is at most `MAX_TOKENS` (12,000) output tokens, adaptive
+    thinking included, whatever the owner's size; the largest chunk, 25
+    org-group pairs, needs far fewer. At 15 output tokens a second, under
+    half the conservative 40 above, a full-length reply streams in 800 s,
+    and the other 100 s covers the time to the first token. Neither speed
+    is measured: the docs give no output rate, and M5's first judged run is
+    the first measurement.
+- **Worst-case wall time per call.** One attempt takes at most about
+  1,200 s: no read starts after 900 s, and the read in progress then ends
+  within its 300 s idle limit. An attempt that receives nothing at all ends
+  after about 310 s (10 s to connect, then the 300 s read timeout). So a
+  call takes at most 5 × 1,200 + 260 s, about 105 minutes. A call whose
+  stream hangs silently takes at most 5 × 310 + 260 s, about 30 minutes.
+  A call that is only throttled waits 90 to 150 s in all, or up to 260 s
+  with `retry-after`. Each worker runs one call at a time, so a run sends
+  at most `--workers` (default 8) requests at once. The caller's own
+  timeout should bound the whole run.
 
 Unlike the default provider, the Bedrock judge does not skip a call. The run
 exits non-zero, writing no `results.json` and leaving no run directory, on any
@@ -190,10 +204,18 @@ how many pairs went unjudged, and `results.json` keeps the counts.
 The run is built in a hidden sibling of the run directory,
 `.<run-name>.partial-*`, which is created before any judge call. A
 `--runs-dir` that cannot hold it, or a run name that is already taken,
-therefore fails before anything is billed. The sibling is renamed to the run
-name only once `results.json`, `summary.md` and `viewer.html` are all
-written, and it is removed on any failure. If the name was taken meanwhile,
-the run exits non-zero rather than replace it. `config` records the provider,
+therefore fails before anything is billed. The sibling has the same mode as
+a run directory on the default provider (what the umask gives). It is
+renamed to the run name only once `results.json`, `summary.md` and
+`viewer.html` are all written, and it is removed on any failure, on Ctrl-C
+and on SIGTERM, which the Bedrock run turns into exit code 143 after
+cleaning up. Only a process killed outright (SIGKILL, the OOM killer) leaves
+the hidden sibling behind; it does no harm, since a rerun makes a new one
+and checks only the run name. If anything has taken the run name meanwhile,
+even an empty directory or a file, the run exits non-zero with `refusing to
+overwrite existing run dir` rather than replace it: the name is claimed with
+`mkdir`, which fails on any existing entry, and the rename then replaces
+only that empty directory. `config` records the provider,
 the model (with an ARN's account id redacted) and `judge_effort: "default"`,
 since no effort level is sent.
 

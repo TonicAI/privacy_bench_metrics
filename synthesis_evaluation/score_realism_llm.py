@@ -66,8 +66,11 @@ Two judge providers:
     retried. The four waits back off exponentially from RETRY_BASE_SEC with
     jitter, about two minutes in all, and each wait is at least the error's
     ``retry-after-ms`` / ``retry-after`` hint, capped at RETRY_AFTER_CAP_SEC.
-    Each attempt is bounded by ATTEMPT_TIMEOUT_SEC, both between reads and
-    over the whole stream. ``JudgeError`` is raised, with no partial result,
+    A read that waits READ_TIMEOUT_SEC for bytes ends the attempt. No read
+    starts once STREAM_DEADLINE_SEC have passed since the attempt began, so
+    a reply that keeps trickling bytes or keepalives still ends, but a reply
+    whose ``message_stop`` has arrived is always kept. Both kinds of timeout
+    are retried. ``JudgeError`` is raised, with no partial result,
     for missing credentials, nothing to judge, a call that still fails, a
     response that does not parse, a response with a malformed verdict for
     one of its pairs (no boolean ``coherent``, or a ``values`` that is not a
@@ -149,7 +152,7 @@ def bedrock_credentials_problem(region: Optional[str]) -> Optional[str]:
     return None
 
 
-ATTEMPT_TIMEOUT_SEC = 300.0
+READ_TIMEOUT_SEC = 300.0
 CONNECT_TIMEOUT_SEC = 10.0
 
 
@@ -157,12 +160,15 @@ def _make_client(provider: str, region: Optional[str]):
     import anthropic
     if provider == PROVIDER_BEDROCK:
         return anthropic.AnthropicBedrock(aws_region=region, max_retries=0,
-                                          timeout=anthropic.Timeout(ATTEMPT_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC))
+                                          timeout=anthropic.Timeout(READ_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC))
     return anthropic.Anthropic(max_retries=MAX_RETRIES)
 
 
+STREAM_DEADLINE_SEC = 900.0
+
+
 class AttemptTimeout(Exception):
-    """A judge attempt whose stream ran past ATTEMPT_TIMEOUT_SEC."""
+    """A judge attempt whose reply was still streaming STREAM_DEADLINE_SEC after the attempt started."""
 
 
 _RETRYABLE_STREAM_ERRORS = frozenset({
@@ -267,7 +273,7 @@ def _call_llm_with_retries(client, system_prompt: str, user_msg: str,
         if stop.is_set():
             raise _Cancelled()
         try:
-            return _call_llm(client, system_prompt, user_msg, deadline=time.monotonic() + ATTEMPT_TIMEOUT_SEC)
+            return _call_llm(client, system_prompt, user_msg, deadline=time.monotonic() + STREAM_DEADLINE_SEC)
         except Exception as exc:
             if stop.is_set():
                 raise _Cancelled() from exc
@@ -817,11 +823,7 @@ def _call_llm(client, system_prompt: str, user_msg: str, deadline: Optional[floa
         messages=[{"role": "user", "content": user_msg}],
         thinking={"type": "adaptive"},
     ) as stream:
-        if deadline is not None:
-            for _event in stream:
-                if time.monotonic() > deadline:
-                    raise AttemptTimeout()
-        resp = stream.get_final_message()
+        resp = stream.get_final_message() if deadline is None else _final_message_by(stream, deadline)
     text_parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
     raw = "".join(text_parts)
     usage = {
@@ -831,6 +833,32 @@ def _call_llm(client, system_prompt: str, user_msg: str, deadline: Optional[floa
         "cache_read_input_tokens":     getattr(resp.usage, "cache_read_input_tokens", 0)     or 0,
     }
     return raw, usage
+
+
+def _final_message_by(stream, deadline: float):
+    """The streamed message, kept as soon as its ``message_stop`` event arrives, however late that is. No read of
+    the response body starts after ``deadline``, so a stream whose bytes or keepalives keep arriving without
+    completing the reply still ends: within one read of the deadline, which READ_TIMEOUT_SEC bounds."""
+    response = stream.response
+    iter_bytes = response.iter_bytes
+    response.iter_bytes = lambda *args, **kwargs: _reads_before(iter_bytes(*args, **kwargs), deadline)
+    for event in stream:
+        if event.type == "message_stop":
+            return stream.current_message_snapshot
+    return stream.get_final_message()
+
+
+def _reads_before(chunks, deadline: float):
+    """``chunks`` as they arrive, raising AttemptTimeout rather than starting a read after ``deadline``."""
+    chunks = iter(chunks)
+    while True:
+        if time.monotonic() > deadline:
+            raise AttemptTimeout()
+        try:
+            chunk = next(chunks)
+        except StopIteration:
+            return
+        yield chunk
 
 
 def _char_orgs(characters: Optional[dict], cid: str) -> List[str]:

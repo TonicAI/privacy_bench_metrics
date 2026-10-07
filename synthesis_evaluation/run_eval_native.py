@@ -41,17 +41,21 @@ and access-denied errors are not retried. Missing credentials, a call that still
 parse, has a malformed verdict for one of its pairs or judges none of them, or a run with every pair unjudged
 exits non-zero. The run is built in a hidden sibling of the run directory, created before the judge starts, so
 an unusable --runs-dir fails before any judge call; it is renamed into place only once everything is written,
-so a failed run leaves nothing behind. Verdicts for pairs outside their call are dropped and counted, and pairs
+and never over an existing entry, so a failed, interrupted or terminated (SIGTERM) run leaves nothing behind.
+Only a process killed outright (SIGKILL, the OOM killer) leaves its hidden `.<run-name>.partial-*` dir. Verdicts for pairs outside their call are dropped and counted, and pairs
 left out of an otherwise valid reply count as skipped; the run prints both counts.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import secrets
 import shutil
+import signal
 import sys
-import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -108,18 +112,57 @@ def render_by_kind(by_kind: Dict[str, dict], diag: dict) -> str:
 
 
 def _staging_dir(out_dir: Path) -> Path:
-    """A fresh hidden sibling of ``out_dir`` to build the run in; exits when ``out_dir``'s parent cannot hold it."""
+    """A fresh hidden sibling of ``out_dir`` to build the run in, with the mode ``out_dir.mkdir()`` would give it;
+    exits when ``out_dir``'s parent cannot hold it."""
     try:
         out_dir.parent.mkdir(parents=True, exist_ok=True)
-        return Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.partial-", dir=out_dir.parent))
+        while True:
+            staging = out_dir.parent / f".{out_dir.name}.partial-{secrets.token_hex(4)}"
+            try:
+                staging.mkdir()
+                return staging
+            except FileExistsError:
+                continue
     except OSError as exc:
         sys.exit(f"cannot write the run dir under {out_dir.parent}: {exc.strerror or type(exc).__name__}")
 
 
 def _publish(staging: Path, out_dir: Path) -> None:
-    if out_dir.exists():
-        sys.exit(f"refusing to overwrite existing run dir: {out_dir}")
-    os.rename(staging, out_dir)
+    """Rename ``staging`` to ``out_dir``, refusing when anything already has that name, even an empty directory:
+    the name is first claimed with ``mkdir``, which fails on any existing entry, and the rename replaces only the
+    empty directory just claimed."""
+    refusal = f"refusing to overwrite existing run dir: {out_dir}"
+    try:
+        out_dir.mkdir()
+    except FileExistsError:
+        sys.exit(refusal)
+    except OSError as exc:
+        sys.exit(f"cannot write the run dir {out_dir}: {exc.strerror or type(exc).__name__}")
+    try:
+        os.rename(staging, out_dir)
+    except BaseException as exc:
+        with contextlib.suppress(OSError):
+            out_dir.rmdir()
+        if isinstance(exc, OSError):
+            sys.exit(refusal)
+        raise
+
+
+def _exit_on_sigterm(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+@contextlib.contextmanager
+def _sigterm_unwinds():
+    """While active, SIGTERM raises SystemExit(143) in the main thread, so ``finally`` blocks still run."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
 
 
 def resolve_judge(ap: argparse.ArgumentParser, args: argparse.Namespace) -> Optional[str]:
@@ -174,14 +217,17 @@ def main() -> int:
     if out_dir.exists():
         sys.exit(f"refusing to overwrite existing run dir: {out_dir}")
     bedrock = judge_region is not None
-    staging = _staging_dir(out_dir) if bedrock else None
     if not bedrock:
         out_dir.mkdir(parents=True)
-    try:
-        return _run(args, out_dir, staging, judge_region)
-    finally:
-        if staging is not None and staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+        return _run(args, out_dir, None, judge_region)
+    with _sigterm_unwinds():
+        staging = None
+        try:
+            staging = _staging_dir(out_dir)
+            return _run(args, out_dir, staging, judge_region)
+        finally:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
 
 
 def _run(args: argparse.Namespace, out_dir: Path, staging: Optional[Path], judge_region: Optional[str]) -> int:
