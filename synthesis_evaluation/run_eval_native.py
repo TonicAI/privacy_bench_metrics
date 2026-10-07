@@ -33,9 +33,13 @@ Bedrock instead, with credentials from the standard AWS chain:
 
         --judge-provider bedrock --judge-model global.anthropic.claude-opus-5-5 [--judge-region us-east-1]
 
-With bedrock, --judge-model is required and the region defaults to AWS_REGION, then AWS_DEFAULT_REGION. The
-bedrock judge never skips: missing credentials, or a judge call that fails after retries, exit non-zero
-without writing results.json.
+With bedrock, --judge-model is required, the region defaults to AWS_REGION, then AWS_DEFAULT_REGION, and
+AWS_BEARER_TOKEN_BEDROCK, when set, takes precedence over the AWS credential chain. A judge call that fails with
+a throttling, overloaded, 5xx or connection error, including partway through its stream, is retried with
+backoff, up to 5 attempts in all; auth, validation and access-denied errors are not retried. Missing credentials, a call that still
+fails, a reply that does not parse or judges none of its pairs, or a run with every pair unjudged exits non-zero
+without writing results.json. Pairs left out of an otherwise valid reply count as skipped, and the run prints
+how many.
 """
 from __future__ import annotations
 
@@ -157,7 +161,8 @@ def main() -> int:
     if out_dir.exists():
         sys.exit(f"refusing to overwrite existing run dir: {out_dir}")
     out_dir.mkdir(parents=True)
-    judge_model = score_realism_llm.redact_account_ids(score_realism_llm.MODEL)
+    bedrock = judge_region is not None
+    judge_model = score_realism_llm.redact_account_ids(score_realism_llm.MODEL) if bedrock else score_realism_llm.MODEL
 
     characters = load_characters(args.characters) if args.characters else None
     print(f"loading predictions from {args.predictions} ...")
@@ -182,7 +187,7 @@ def main() -> int:
     if args.skip_llm_judge:
         realism_llm = {"skipped_reason": "--skip-llm-judge", "per_character": {}, "overall": {"coherent": 0, "incoherent": 0, "skipped": 0}}
     else:
-        print(f"LLM judge ({args.judge_provider}: {judge_model}) ...")
+        print(f"LLM judge ({args.judge_provider}: {judge_model}) ..." if bedrock else f"LLM judge ({judge_model}) ...")
         t = time.monotonic()
         try:
             realism_llm = score_realism_llm.score(rows, characters=characters, workers=args.workers,
@@ -201,13 +206,15 @@ def main() -> int:
     print(f"\nscores — ner_recall={_p(o['ner_recall'])}  synthesis_accuracy={_p(o['synthesis_accuracy'])}  combined={_p(o['combined_accuracy'])}")
     for kind, b in metrics["by_kind"].items():
         print(f"  {kind:10s} recall={_p(b['ner_recall'])}  synthesis={_p(b['synthesis_accuracy'])}  combined={_p(b['combined_accuracy'])}  (gold {b['gold']:,})")
+    if bedrock:
+        n_skipped, n_pairs = score_realism_llm.pair_counts(realism_llm)
+        print(f"judge: {n_skipped} of {n_pairs} pairs unjudged ({n_skipped / n_pairs:.1%}), counted as skipped")
 
     results = {
         "config": {"predictions": str(args.predictions), "ground_truth": str(args.ground_truth),
                    "characters": str(args.characters) if args.characters else None, "run_name": args.run_name,
-                   "format": "native", "overlap_threshold": args.overlap,
-                   "judge_provider": None if args.skip_llm_judge else args.judge_provider,
-                   "judge_model": None if args.skip_llm_judge else judge_model,
+                   "format": "native", "overlap_threshold": args.overlap, "judge_model": None if args.skip_llm_judge else judge_model,
+                   **({"judge_provider": args.judge_provider, "judge_effort": "default"} if bedrock else {}),
                    "n_rows": len(rows), "tier": "entity", "labels": list(LABELS)},
         "timings_sec": timings,
         "metrics": metrics,

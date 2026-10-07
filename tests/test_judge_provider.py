@@ -13,12 +13,15 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from synthesis_evaluation import run_eval_native, score_realism_llm
+from synthesis_evaluation import native, run_eval_native, score_realism_llm
+from synthesis_evaluation.load import load_jsonl
 
 ENV_KEYS = ("ANTHROPIC_API_KEY", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_BEARER_TOKEN_BEDROCK",
             "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE")
@@ -73,7 +76,10 @@ class _Messages:
 
     def stream(self, **kwargs):
         self._owner.requests.append(kwargs)
-        return _Stream(self._owner.reply)
+        reply = self._owner.reply
+        if callable(reply) and not isinstance(reply, Exception):
+            reply = reply(kwargs)
+        return _Stream(reply)
 
 
 def _fake_client_class(name: str, reply):
@@ -98,8 +104,55 @@ def _fake_anthropic(reply=json.dumps(GOOD_VERDICTS), bedrock_reply=None):
     return mod
 
 
-def _write_fixture(root: Path) -> dict:
-    """One email with a character's given and family name, both detected and replaced."""
+class FakeStatusError(Exception):
+    """Shaped like the SDK's APIStatusError; a mid-stream error frame arrives with status 200 and an error code."""
+
+    def __init__(self, status_code: int, code=None):
+        super().__init__("Megan Donovan works at Acme00")
+        self.status_code = status_code
+        self.body = {"type": "error", "error": {"type": code, "message": "Megan"}} if code else None
+
+
+class APIConnectionError(Exception):
+    pass
+
+
+class TransportError(Exception):
+    pass
+
+
+class ReadError(TransportError):
+    pass
+
+
+def _replies(*items):
+    """A reply that answers successive calls with ``items`` in turn, repeating the last."""
+    queue = list(items)
+
+    def reply(_kwargs):
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+    return reply
+
+
+def _is_org_call(kwargs) -> bool:
+    return kwargs["system"][0]["text"] == score_realism_llm.ORG_SYSTEM_PROMPT
+
+
+def _user_text(kwargs) -> str:
+    return kwargs["messages"][0]["content"]
+
+
+def _org_verdict(surface: str) -> str:
+    return json.dumps({"verdicts": [{"label": "ORGANIZATION", "surface": surface, "coherent": True,
+                                     "values": [], "issues": [], "confidence": "sure"}]})
+
+
+ORG_GROUP = "Acme Holdings"
+
+
+def _write_fixture(root: Path, org_surfaces: int = 0) -> dict:
+    """One email with a character's given and family name, both detected and replaced; with ``org_surfaces``,
+    a second email naming that many distinct surfaces of one org group, each detected and replaced."""
     text = "Hi Megan Donovan"
     gold = {"file": {"kind": "eml", "path": "email/a.eml", "container": None}, "text": text, "meta": {"row_id": "r1"},
             "ground_truth_spans": [
@@ -116,22 +169,43 @@ def _write_fixture(root: Path) -> dict:
                     "organizations": []}}
     paths = {"ground_truth": root / "ground_truth.jsonl", "predictions": root / "predictions.jsonl",
              "characters": root / "characters.json", "runs": root / "runs"}
-    paths["ground_truth"].write_text(json.dumps(gold) + "\n")
-    paths["predictions"].write_text(json.dumps(preds) + "\n")
+    gold_rows, pred_rows = [gold], [preds]
+    if org_surfaces:
+        names = [f"Acme{i:02d}" for i in range(org_surfaces)]
+        org_text = " ".join(names)
+        loc = lambda i: {"kind": "eml", "file_char_start": 7 * i, "file_char_end": 7 * i + 6}
+        gold_rows.append({"file": {"kind": "eml", "path": "email/b.eml", "container": None}, "text": org_text,
+                          "meta": {"row_id": "r2"}, "ground_truth_spans": [
+                              {"text": n, "start": 7 * i, "end": 7 * i + 6, "label": "ORGANIZATION", "characters": [],
+                               "org_group": ORG_GROUP, "location": loc(i)} for i, n in enumerate(names)]})
+        pred_rows.append({"file": {"kind": "eml", "path": "email/b.eml", "container": None}, "spans": [
+            {"label": "ORGANIZATION", "text": n, "new_text": f"Zeta{i:02d}", "location": loc(i)}
+            for i, n in enumerate(names)]})
+    paths["ground_truth"].write_text("".join(json.dumps(r) + "\n" for r in gold_rows))
+    paths["predictions"].write_text("".join(json.dumps(r) + "\n" for r in pred_rows))
     paths["characters"].write_text(json.dumps(chars))
     return paths
 
 
+BEDROCK = ("--judge-provider", "bedrock", "--judge-model", "global.anthropic.claude-opus-5-5",
+           "--judge-region", "us-east-1")
+
+
 class JudgeCliTestCase(unittest.TestCase):
+    org_surfaces = 0
+
     def setUp(self):
         self._model = score_realism_llm.MODEL
         self._tmp = tempfile.TemporaryDirectory()
-        self.paths = _write_fixture(Path(self._tmp.name))
+        self.paths = _write_fixture(Path(self._tmp.name), org_surfaces=self.org_surfaces)
         env = mock.patch.dict(os.environ, {})
         env.start()
         self.addCleanup(env.stop)
         for key in ENV_KEYS:
             os.environ.pop(key, None)
+        sleep = mock.patch.object(score_realism_llm, "_retry_sleep")
+        self.sleep = sleep.start()
+        self.addCleanup(sleep.stop)
 
     def tearDown(self):
         score_realism_llm.MODEL = self._model
@@ -191,11 +265,10 @@ class ArgumentValidationTests(JudgeCliTestCase):
         self.assert_rejected("--judge-provider", "vertex", message="invalid choice")
 
     def test_missing_credentials_fail_before_any_call(self):
-        code, _, err, module = self.run_main("--judge-provider", "bedrock", "--judge-model",
-                                             "global.anthropic.claude-opus-5-5", "--judge-region", "us-east-1",
-                                             credentials_problem="no AWS credentials found")
+        code, out, err, module = self.run_main(*BEDROCK, credentials_problem="no AWS credentials found")
         self.assertNotEqual(code, 0)
-        self.assertIn("no AWS credentials found", err)
+        self.assertIn("bedrock judge unavailable: no AWS credentials found", err)
+        self.assertNotIn("loading predictions", out)
         self.assertFalse(self.run_dir().exists())
         self.assertEqual(module.AnthropicBedrock.instances, [])
 
@@ -218,6 +291,8 @@ class BedrockJudgeTests(JudgeCliTestCase):
         results = self.results()
         self.assertEqual(results["config"]["judge_provider"], "bedrock")
         self.assertEqual(results["config"]["judge_model"], "global.anthropic.claude-opus-5-5")
+        self.assertEqual(results["config"]["judge_effort"], "default")
+        self.assertNotIn("output_config", request)
         judge = results["detail"]["judge"]
         self.assertNotIn("skipped_reason", judge)
         self.assertEqual(judge["provider"], "bedrock")
@@ -255,13 +330,13 @@ class BedrockJudgeTests(JudgeCliTestCase):
     def test_failing_call_fails_the_run(self):
         module = _fake_anthropic(bedrock_reply=RuntimeError(
             "AccessDeniedException: arn:aws:sts::123456789012:assumed-role/judge is not authorized"))
-        code, _, err, _ = self.run_main("--judge-provider", "bedrock", "--judge-model",
-                                        "global.anthropic.claude-opus-5-5", "--judge-region", "us-east-1",
-                                        anthropic_module=module)
+        code, _, err, _ = self.run_main(*BEDROCK, anthropic_module=module)
         self.assertNotEqual(code, 0)
-        self.assertIn("LLM judge failed", err)
-        self.assertIn("AccessDeniedException", err)
+        self.assertIn("LLM judge failed, no results written: bedrock judge call for character 1 of 1 failed: "
+                      "RuntimeError after 1 attempt(s)", err)
         self.assertNotIn("123456789012", err)
+        self.assertNotIn("assumed-role", err)
+        self.assertEqual(len(module.AnthropicBedrock.instances[0].requests), 1)
         self.assertFalse((self.run_dir() / "results.json").exists())
         self.assertFalse(self.run_dir().exists())
 
@@ -279,6 +354,190 @@ class BedrockJudgeTests(JudgeCliTestCase):
                 mock.patch.object(score_realism_llm, "bedrock_credentials_problem", return_value=None):
             with self.assertRaises(score_realism_llm.JudgeError):
                 score_realism_llm.score([], provider="bedrock", region="us-east-1")
+
+
+class BedrockReplyCoverageTests(JudgeCliTestCase):
+    """R-1 and R-2: a reply that judges none of its pairs fails the run; one that leaves some out is counted."""
+
+    def assert_fails_without_results(self, reply, message: str):
+        code, out, err, _ = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
+        self.assertNotEqual(code, 0)
+        self.assertIn(message, err)
+        self.assertFalse(self.run_dir().exists())
+        for gold in ("Megan", "Donovan", "c1"):
+            self.assertNotIn(gold, err)
+        return out, err
+
+    def test_empty_verdict_list_fails(self):
+        self.assert_fails_without_results(json.dumps({"verdicts": []}),
+                                          "character 1 of 1 failed: the response judged none of its 2 pairs")
+
+    def test_verdicts_matching_no_pair_fail(self):
+        reply = json.dumps({"verdicts": [
+            {"label": "NAME_GIVEN", "surface": "megan", "coherent": True, "values": []},
+            {"label": "GIVEN_NAME", "surface": "Donovan", "coherent": True, "values": []}]})
+        self.assert_fails_without_results(reply, "the response judged none of its 2 pairs")
+
+    def test_non_dict_verdicts_fail(self):
+        self.assert_fails_without_results(json.dumps({"verdicts": ["ok", "ok"]}),
+                                          "the response judged none of its 2 pairs")
+
+    def test_a_run_with_every_pair_unjudged_fails(self):
+        with mock.patch.object(score_realism_llm, "_judged_pairs", return_value=1):
+            self.assert_fails_without_results(json.dumps({"verdicts": []}), "bedrock judge left all 2 pairs unjudged")
+
+    def test_partial_omission_counts_as_skipped_and_is_printed(self):
+        reply = json.dumps({"verdicts": GOOD_VERDICTS["verdicts"][:1]})
+        code, out, err, _ = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(bedrock_reply=reply))
+        self.assertEqual(code, 0, err)
+        self.assertIn("judge: 1 of 2 pairs unjudged (50.0%), counted as skipped", out)
+        results = self.results()
+        self.assertEqual(results["detail"]["judge"]["per_label_totals"]["NAME_FAMILY"]["skipped"], 1)
+        self.assertEqual(results["metrics"]["overall"]["skipped"], 1)
+
+    def test_complete_reply_prints_zero_unjudged(self):
+        code, out, err, _ = self.run_main(*BEDROCK)
+        self.assertEqual(code, 0, err)
+        self.assertIn("judge: 0 of 2 pairs unjudged (0.0%)", out)
+
+
+class BedrockRetryTests(JudgeCliTestCase):
+    """R-3: retryable failures, including mid-stream ones, are retried with backoff; others are not."""
+
+    def run_with(self, reply):
+        module = _fake_anthropic(bedrock_reply=reply)
+        code, out, err, _ = self.run_main(*BEDROCK, anthropic_module=module)
+        return code, out, err, module.AnthropicBedrock.instances[0].requests
+
+    def test_mid_stream_throttle_is_retried(self):
+        code, _, err, requests = self.run_with(_replies(FakeStatusError(200, "throttlingException"),
+                                                        json.dumps(GOOD_VERDICTS)))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(self.sleep.call_count, 1)
+        self.assertEqual(self.results()["metrics"]["overall"]["synthesis_accuracy"], 1.0)
+
+    def test_retryable_failures_are_retried(self):
+        for exc in (FakeStatusError(429), FakeStatusError(500), FakeStatusError(529), FakeStatusError(503),
+                    FakeStatusError(200, "overloaded_error"), FakeStatusError(200, "internalServerException"),
+                    FakeStatusError(200, "modelStreamErrorException"), APIConnectionError("reset"), ReadError("eof")):
+            with self.subTest(exc=type(exc).__name__, status=getattr(exc, "status_code", None)):
+                self.assertTrue(score_realism_llm.is_retryable(exc))
+
+    def test_other_failures_are_not_retried(self):
+        for exc in (FakeStatusError(400), FakeStatusError(401), FakeStatusError(403), FakeStatusError(404),
+                    FakeStatusError(422), FakeStatusError(200, "validationException"),
+                    FakeStatusError(200, "accessDeniedException"), FakeStatusError(200), RuntimeError("boom"),
+                    ValueError("bad")):
+            with self.subTest(exc=type(exc).__name__, status=getattr(exc, "status_code", None)):
+                self.assertFalse(score_realism_llm.is_retryable(exc))
+
+    def test_access_denied_is_tried_once(self):
+        code, _, err, requests = self.run_with(FakeStatusError(403))
+        self.assertNotEqual(code, 0)
+        self.assertIn("FakeStatusError (HTTP 403) after 1 attempt(s)", err)
+        self.assertEqual(len(requests), 1)
+        self.sleep.assert_not_called()
+        self.assertFalse(self.run_dir().exists())
+
+    def test_retries_are_bounded_with_exponential_backoff(self):
+        code, _, err, requests = self.run_with(FakeStatusError(200, "throttlingException"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("FakeStatusError (HTTP 200, throttlingException) after 5 attempt(s)", err)
+        self.assertEqual(len(requests), score_realism_llm.JUDGE_ATTEMPTS)
+        delays = [c.args[0] for c in self.sleep.call_args_list]
+        self.assertEqual(len(delays), score_realism_llm.JUDGE_ATTEMPTS - 1)
+        for attempt, delay in enumerate(delays, 1):
+            ceiling = min(score_realism_llm.RETRY_CAP_SEC, score_realism_llm.RETRY_BASE_SEC * 2 ** (attempt - 1))
+            self.assertGreaterEqual(delay, ceiling / 2)
+            self.assertLessEqual(delay, ceiling)
+        self.assertFalse(self.run_dir().exists())
+
+    def test_error_message_carries_no_exception_text(self):
+        _, out, err, _ = self.run_with(FakeStatusError(200, "throttlingException"))
+        for gold in ("Megan", "Donovan", "Acme"):
+            self.assertNotIn(gold, err + out)
+
+    def test_default_provider_does_not_retry(self):
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        module = _fake_anthropic(reply=_replies(FakeStatusError(200, "overloaded_error"), json.dumps(GOOD_VERDICTS)))
+        code, _, err, _ = self.run_main(anthropic_module=module)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(module.Anthropic.instances[0].requests), 1)
+        self.assertEqual(self.results()["detail"]["judge"]["per_label_totals"]["NAME_GIVEN"]["skipped"], 1)
+
+
+class BedrockOrgGroupTests(JudgeCliTestCase):
+    """R-4 (B2) and R-5: a chunked org group fails the run on any bad chunk, and the error names no org."""
+
+    org_surfaces = 30
+
+    def org_reply(self, first_chunk):
+        def reply(kwargs):
+            if not _is_org_call(kwargs):
+                return json.dumps(GOOD_VERDICTS)
+            return first_chunk if "'Acme00'" in _user_text(kwargs) else _org_verdict("Acme29")
+        return reply
+
+    def assert_org_failure(self, first_chunk, message: str):
+        code, out, err, module = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(
+            bedrock_reply=self.org_reply(first_chunk)))
+        self.assertNotEqual(code, 0)
+        self.assertIn(f"bedrock judge call for org group 1 of 1 failed: chunk 1 of 2: {message}", err)
+        self.assertFalse(self.run_dir().exists())
+        self.assertNotIn("Acme", err + out)
+        self.assertNotIn(ORG_GROUP, err + out)
+
+    def test_both_chunks_judged(self):
+        code, out, err, module = self.run_main(*BEDROCK, anthropic_module=_fake_anthropic(
+            bedrock_reply=self.org_reply(_org_verdict("Acme00"))))
+        self.assertEqual(code, 0, err)
+        org_requests = [r for r in module.AnthropicBedrock.instances[0].requests if _is_org_call(r)]
+        self.assertEqual(len(org_requests), 2)
+        self.assertIn("judge: 28 of 32 pairs unjudged", out)
+
+    def test_unparseable_first_chunk_fails_the_run(self):
+        self.assert_org_failure("not json", "the response did not parse as a verdict list")
+
+    def test_first_chunk_matching_no_pair_fails_the_run(self):
+        self.assert_org_failure(_org_verdict("acme00"), "the response judged none of its 25 pairs")
+
+    def test_failing_first_chunk_fails_the_run(self):
+        self.assert_org_failure(FakeStatusError(400), "FakeStatusError (HTTP 400) after 1 attempt(s)")
+
+    def test_queued_calls_never_start_after_a_failure(self):
+        module = _fake_anthropic(bedrock_reply=FakeStatusError(403))
+        code, _, err, _ = self.run_main(*BEDROCK, "--workers", "1", anthropic_module=module)
+        for thread in threading.enumerate():
+            if thread.name.startswith("ThreadPoolExecutor"):
+                thread.join(timeout=5)
+        self.assertNotEqual(code, 0)
+        self.assertIn("character 1 of 1 failed", err)
+        self.assertEqual(len(module.AnthropicBedrock.instances[0].requests), 1)
+
+
+    def test_an_in_flight_owner_starts_no_further_call_after_a_failure(self):
+        org_started, char_failed = threading.Event(), threading.Event()
+
+        def reply(kwargs):
+            if not _is_org_call(kwargs):
+                org_started.wait(timeout=5)
+                char_failed.set()
+                return FakeStatusError(403)
+            org_started.set()
+            char_failed.wait(timeout=5)
+            time.sleep(0.2)
+            return _org_verdict("Acme00")
+
+        module = _fake_anthropic(bedrock_reply=reply)
+        code, _, err, _ = self.run_main(*BEDROCK, "--workers", "2", anthropic_module=module)
+        for thread in threading.enumerate():
+            if thread.name.startswith("ThreadPoolExecutor"):
+                thread.join(timeout=5)
+        self.assertNotEqual(code, 0)
+        self.assertIn("character 1 of 1 failed", err)
+        requests = module.AnthropicBedrock.instances[0].requests
+        self.assertEqual([_is_org_call(r) for r in requests], [False, True])
 
 
 class BedrockCredentialsTests(unittest.TestCase):
@@ -321,11 +580,20 @@ class BedrockCredentialsTests(unittest.TestCase):
         self.assertIn("no AWS region", problem)
 
     def test_score_raises_on_missing_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _write_fixture(Path(tmp))
+            preds = native.load_predictions(load_jsonl(paths["predictions"]))
+            rows, _, _ = native.join(list(load_jsonl(paths["ground_truth"])), preds, threshold=native.MATCH_THRESHOLD)
         module = _fake_anthropic()
         with mock.patch.dict(sys.modules, {"anthropic": module, "boto3": self._boto3(None)}):
-            with self.assertRaises(score_realism_llm.JudgeError):
-                score_realism_llm.score([], provider="bedrock", region="us-east-1")
+            with self.assertRaises(score_realism_llm.JudgeError) as caught:
+                score_realism_llm.score(rows, provider="bedrock", region="us-east-1")
+        self.assertIn("no AWS credentials", str(caught.exception))
         self.assertEqual(module.AnthropicBedrock.instances, [])
+
+
+BASE_CONFIG_KEYS = ["predictions", "ground_truth", "characters", "run_name", "format", "overlap_threshold",
+                    "judge_model", "n_rows", "tier", "labels"]
 
 
 class AnthropicDefaultTests(JudgeCliTestCase):
@@ -338,18 +606,23 @@ class AnthropicDefaultTests(JudgeCliTestCase):
         self.assertEqual(results["detail"]["judge"]["skipped_reason"], "ANTHROPIC_API_KEY not set")
         self.assertTrue(results["metrics"]["judge_skipped"])
         self.assertIsNone(results["metrics"]["overall"]["synthesis_accuracy"])
-        self.assertEqual(results["config"]["judge_provider"], "anthropic")
+        self.assertEqual(list(results["config"]), BASE_CONFIG_KEYS)
         self.assertEqual(results["config"]["judge_model"], score_realism_llm.MODEL)
 
     def test_uses_the_direct_api(self):
         os.environ["ANTHROPIC_API_KEY"] = "fake"
-        code, _, err, module = self.run_main("--judge-model", "claude-opus-5-5")
+        code, out, err, module = self.run_main("--judge-model", "claude-opus-5-5")
         self.assertEqual(code, 0, err)
         self.assertEqual(module.AnthropicBedrock.instances, [])
         [client] = module.Anthropic.instances
         self.assertEqual(client.kwargs, {"max_retries": 6})
         self.assertEqual(client.requests[0]["model"], "claude-opus-5-5")
-        self.assertEqual(self.results()["metrics"]["overall"]["synthesis_accuracy"], 1.0)
+        results = self.results()
+        self.assertEqual(results["metrics"]["overall"]["synthesis_accuracy"], 1.0)
+        self.assertEqual(list(results["config"]), BASE_CONFIG_KEYS)
+        self.assertEqual(list(results["detail"]["judge"])[:2], ["model", "usage"])
+        self.assertIn("LLM judge (claude-opus-5-5) ...", out)
+        self.assertNotIn("pairs unjudged", out)
 
     def test_failing_call_still_counts_as_skipped(self):
         os.environ["ANTHROPIC_API_KEY"] = "fake"
@@ -364,7 +637,7 @@ class AnthropicDefaultTests(JudgeCliTestCase):
     def test_skip_flag(self):
         code, _, err, module = self.run_main("--skip-llm-judge")
         self.assertEqual(code, 0, err)
-        self.assertIsNone(self.results()["config"]["judge_provider"])
+        self.assertEqual(list(self.results()["config"]), BASE_CONFIG_KEYS)
         self.assertIsNone(self.results()["config"]["judge_model"])
 
 

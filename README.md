@@ -130,14 +130,24 @@ To run the judge on Amazon Bedrock instead of the Claude API, install
 ```
 
 `--judge-model` is required there (a Bedrock model or inference-profile id or
-ARN), the region defaults to `AWS_REGION`, then `AWS_DEFAULT_REGION`, and
-credentials come from the standard AWS chain; `ANTHROPIC_API_KEY` is not read.
-The calls stream, so the caller needs `bedrock:InvokeModelWithResponseStream`
-on the inference profile and the foundation models it routes to. Unlike the
-default provider, the Bedrock judge never skips: missing credentials, a call
-that still fails after retries, or a response that does not parse exit
-non-zero without writing `results.json`. `config` records the provider and the
-model (an ARN's account id is redacted).
+ARN) and the region defaults to `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+`AWS_BEARER_TOKEN_BEDROCK`, when set, takes precedence; otherwise credentials
+come from the standard AWS chain. `ANTHROPIC_API_KEY` is not read. The calls
+stream, so the caller needs `bedrock:InvokeModelWithResponseStream` on the
+inference profile and the foundation models it routes to.
+
+A Bedrock judge call that fails with a throttling, overloaded, 5xx or
+connection error, including one raised partway through the response stream,
+is retried with exponential backoff and jitter, up to 5 attempts in all. Auth,
+validation and access-denied errors are not retried. Unlike the default
+provider, the Bedrock judge does not skip a call: missing credentials, a call
+that still fails, a reply that does not parse or judges none of its pairs, or
+a run in which every pair is unjudged exits non-zero without writing
+`results.json`. A pair that an otherwise valid reply leaves out still counts
+as skipped (it stays in the synthesis-accuracy denominator); the run prints
+how many pairs went unjudged, and `results.json` keeps the counts. `config`
+records the provider, the model (an ARN's account id is redacted) and
+`judge_effort: "default"`, since no effort level is sent.
 
 Each gold span is matched to the predicted span of the same file unit that
 overlaps it most in native coordinates (at least half of the union) and carries

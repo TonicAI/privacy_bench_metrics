@@ -56,16 +56,25 @@ Two judge providers:
   - ``anthropic`` (the default): the direct Claude API, keyed by
     ANTHROPIC_API_KEY. Without the key the judge is skipped, and a call that
     fails or does not parse counts its buckets as skipped.
-  - ``bedrock``: Amazon Bedrock through ``anthropic.AnthropicBedrock``, with
-    credentials from the standard AWS chain and an explicit region. This judge
-    never skips: missing credentials, nothing to judge, a call that still fails
-    after retries, or a response that does not parse raises ``JudgeError``.
+  - ``bedrock``: Amazon Bedrock through ``anthropic.AnthropicBedrock`` in an
+    explicit region, authenticated by ``AWS_BEARER_TOKEN_BEDROCK`` when it is
+    set and otherwise by the standard AWS credential chain. Each call is
+    retried, up to JUDGE_ATTEMPTS attempts with exponential backoff and
+    jitter, when it fails with a throttling, overloaded, 5xx or connection
+    error, including one raised partway through the response stream; an auth,
+    validation or access-denied error is never retried. ``JudgeError`` is
+    raised, with no partial result, for missing credentials, nothing to
+    judge, a call that still fails, a response that does not parse, a
+    response that judges none of its pairs, or a run in which every pair is
+    unjudged. A pair that a valid response leaves out still counts as
+    skipped, as on the default provider; ``pair_counts`` reports how many.
 """
 from __future__ import annotations
 
 import concurrent.futures
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -131,6 +140,78 @@ def _make_client(provider: str, region: Optional[str]):
     if provider == PROVIDER_BEDROCK:
         return anthropic.AnthropicBedrock(aws_region=region, max_retries=MAX_RETRIES)
     return anthropic.Anthropic(max_retries=MAX_RETRIES)
+
+
+_RETRYABLE_STREAM_ERRORS = frozenset({
+    "overloaded_error", "rate_limit_error", "api_error",
+    "throttlingexception", "serviceunavailableexception", "internalserverexception",
+    "modelstreamerrorexception",
+})
+_CONNECTION_ERRORS = frozenset({"APIConnectionError", "TransportError"})
+_ERROR_CODE_RE = re.compile(r"[A-Za-z_]{1,64}")
+
+
+def _stream_error_code(exc: BaseException) -> Optional[str]:
+    """The error type an ``error`` event (or a Bedrock exception frame) carried, when it is a plain identifier."""
+    body = getattr(exc, "body", None)
+    err = body.get("error") if isinstance(body, dict) else None
+    code = err.get("type") if isinstance(err, dict) else None
+    return code if isinstance(code, str) and _ERROR_CODE_RE.fullmatch(code) else None
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """Whether a failed judge call is worth retrying: throttling, overloaded, 5xx and connection errors are;
+    auth, validation, access-denied and every other error are not."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status != 200:
+        return status == 429 or status >= 500
+    code = _stream_error_code(exc)
+    if code is not None:
+        return code.lower() in _RETRYABLE_STREAM_ERRORS
+    return any(c.__name__ in _CONNECTION_ERRORS for c in type(exc).__mro__)
+
+
+def describe_error(exc: BaseException) -> str:
+    """A failed call named by its exception type, HTTP status and error code only, never its message."""
+    details = []
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        details.append(f"HTTP {status}")
+    code = _stream_error_code(exc)
+    if code:
+        details.append(code)
+    return type(exc).__name__ + (f" ({', '.join(details)})" if details else "")
+
+
+class _CallFailed(Exception):
+    """A judge call that failed for good; its message is safe to print."""
+
+
+class _Cancelled(Exception):
+    """Another judge call already failed the run."""
+
+
+JUDGE_ATTEMPTS = 5
+RETRY_BASE_SEC = 2.0
+RETRY_CAP_SEC = 30.0
+_retry_sleep = time.sleep
+
+
+def _call_llm_with_retries(client, system_prompt: str, user_msg: str,
+                           stop: threading.Event) -> Tuple[str, dict]:
+    for attempt in range(1, JUDGE_ATTEMPTS + 1):
+        if stop.is_set():
+            raise _Cancelled()
+        try:
+            return _call_llm(client, system_prompt, user_msg)
+        except Exception as exc:
+            if stop.is_set():
+                raise _Cancelled() from exc
+            if attempt == JUDGE_ATTEMPTS or not is_retryable(exc):
+                raise _CallFailed(f"{describe_error(exc)} after {attempt} attempt(s)") from exc
+            delay = min(RETRY_CAP_SEC, RETRY_BASE_SEC * 2 ** (attempt - 1))
+            _retry_sleep(delay / 2 + random.uniform(0, delay / 2))
+    raise AssertionError("unreachable")
 
 # Character-level judging covers every label a character can own; ORGANIZATION
 # is judged per org GROUP, together with the addresses, phones, URLs and
@@ -733,6 +814,45 @@ def _has_verdicts(parsed: Optional[dict]) -> bool:
     return isinstance(parsed, dict) and isinstance(parsed.get("verdicts"), list)
 
 
+def _judged_pairs(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
+                  allowed: Tuple[str, ...], default_label: str) -> int:
+    """How many of ``mapping``'s (label, surface) pairs a parsed reply judges, matched the way the tallies match."""
+    verdicts = parsed.get("verdicts") if isinstance(parsed, dict) else None
+    if not isinstance(verdicts, list):
+        return 0
+    pairs = set()
+    for entry in verdicts:
+        if isinstance(entry, dict) and isinstance(entry.get("surface"), str):
+            lab = _verdict_label(entry, default_label)
+            if lab in allowed and entry["surface"] in (mapping.get(lab) or {}):
+                pairs.add((lab, entry["surface"]))
+    return len(pairs)
+
+
+def _n_pairs(mapping: Dict[str, Dict[str, List[str]]]) -> int:
+    return sum(len(sub) for sub in mapping.values())
+
+
+def pair_counts(result: dict) -> Tuple[int, int]:
+    """(unjudged pairs, all pairs) over a judge result's character, org-group and unowned tallies."""
+    skipped = total = 0
+    for section in ("per_label_totals", "org_by_label_totals", "unowned_by_label_totals"):
+        for t in (result.get(section) or {}).values():
+            skipped += t.get("skipped", 0)
+            total += t.get("coherent", 0) + t.get("incoherent", 0) + t.get("skipped", 0)
+    return skipped, total
+
+
+def _reply_problem(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
+                   allowed: Tuple[str, ...], default_label: str) -> Optional[str]:
+    """Why a bedrock reply cannot be used, or None; names counts only, never the pairs."""
+    if not _has_verdicts(parsed):
+        return "the response did not parse as a verdict list"
+    if _judged_pairs(parsed, mapping, allowed, default_label) == 0:
+        return f"the response judged none of its {_n_pairs(mapping)} pairs"
+    return None
+
+
 def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
           workers: int = 8, provider: str = PROVIDER_ANTHROPIC,
           region: Optional[str] = None) -> dict:
@@ -747,8 +867,10 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     consistency.
 
     ``provider`` is ``"anthropic"`` (the direct API) or ``"bedrock"``
-    (``AnthropicBedrock`` in ``region``). The bedrock judge raises
-    ``JudgeError`` instead of returning a skipped or partial result.
+    (``AnthropicBedrock`` in ``region``). The bedrock judge retries a call
+    that fails with a retryable error, and raises ``JudgeError`` instead of
+    returning a skipped result, a failed call or a reply that judges none of
+    its pairs; pairs left out of an otherwise valid reply count as skipped.
     """
     if provider not in PROVIDERS:
         raise ValueError(f"unknown judge provider: {provider!r}")
@@ -781,6 +903,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         }
 
     client = _make_client(provider, region)
+    stop = threading.Event()
 
     metrics_lock = threading.Lock()
     totals = {"input_tokens": 0, "output_tokens": 0,
@@ -796,7 +919,15 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             if parsed is None:
                 totals["n_parse_failures"] += 1
 
-    def process_one(cid: str) -> Tuple[str, Optional[dict], Optional[str], str]:
+    def _call(system_prompt: str, user_msg: str) -> Tuple[str, dict]:
+        if strict:
+            return _call_llm_with_retries(client, system_prompt, user_msg, stop)
+        return _call_llm(client, system_prompt, user_msg)
+
+    def _call_error(exc: Exception) -> str:
+        return str(exc) if isinstance(exc, _CallFailed) else f"{type(exc).__name__}: {exc}"
+
+    def process_one(cid: str) -> Optional[Tuple[str, Optional[dict], Optional[str], str]]:
         # Organization context: the character's employer(s) and the
         # synthetic org(s) each was mapped to across the corpus.
         org_ctx: List[Tuple[str, List[str]]] = []
@@ -807,14 +938,20 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         user_msg = _build_user_message(cid, mappings[cid],
                                        org_context=org_ctx or None)
         try:
-            raw, usage = _call_llm(client, SYSTEM_PROMPT, user_msg)
+            raw, usage = _call(SYSTEM_PROMPT, user_msg)
+        except _Cancelled:
+            return None
         except Exception as exc:
-            return cid, None, f"{type(exc).__name__}: {exc}", ""
+            return cid, None, _call_error(exc), ""
         parsed = _parse_response(raw)
         _record(usage, parsed)
+        if strict:
+            problem = _reply_problem(parsed, mappings[cid], CHAR_LABELS, "")
+            if problem:
+                return cid, None, problem, raw
         return cid, parsed, None, raw
 
-    def process_org(grp: str) -> Tuple[str, Optional[dict], Optional[str], str]:
+    def process_org(grp: str) -> Optional[Tuple[str, Optional[dict], Optional[str], str]]:
         # A dominant org (a corpus protagonist's employer) can carry more surface buckets than
         # one MAX_TOKENS response can hold — the verdict JSON truncates mid-list and the whole
         # group used to count as skipped. Chunk the group's buckets across calls and merge.
@@ -836,35 +973,64 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         for n_chunk, piece in enumerate(chunks):
             user_msg = _build_org_user_message(grp, piece)
             try:
-                raw, usage = _call_llm(client, ORG_SYSTEM_PROMPT, user_msg)
+                raw, usage = _call(ORG_SYSTEM_PROMPT, user_msg)
+            except _Cancelled:
+                return None
             except Exception as exc:
-                first_error = first_error or f"{type(exc).__name__}: {exc}"
                 if strict:
+                    first_error = f"chunk {n_chunk + 1} of {len(chunks)}: {_call_error(exc)}"
                     break
+                first_error = first_error or f"{type(exc).__name__}: {exc}"
                 continue
             parsed = _parse_response(raw)
             _record(usage, parsed)
             raws.append(raw)
+            if strict:
+                problem = _reply_problem(parsed, piece, ORG_LABELS, "ORGANIZATION")
+                if problem:
+                    first_error = f"chunk {n_chunk + 1} of {len(chunks)}: {problem}"
+                    break
             if parsed and isinstance(parsed.get("verdicts"), list):
                 verdicts.extend(parsed["verdicts"])
-            elif strict:
-                first_error = f"chunk {n_chunk + 1}/{len(chunks)} did not parse"
-                break
         if strict and first_error:
             return grp, None, first_error, "\n".join(raws)
         if not verdicts:
             return grp, None, first_error or "no chunk parsed", "\n".join(raws)
         return grp, {"verdicts": verdicts}, None, "\n".join(raws)
 
-    def process_unowned(i: int) -> Tuple[str, Optional[dict], Optional[str], str]:
+    def process_unowned(i: int) -> Optional[Tuple[str, Optional[dict], Optional[str], str]]:
         user_msg = _build_unowned_user_message(unowned_batches[i])
         try:
-            raw, usage = _call_llm(client, UNOWNED_SYSTEM_PROMPT, user_msg)
+            raw, usage = _call(UNOWNED_SYSTEM_PROMPT, user_msg)
+        except _Cancelled:
+            return None
         except Exception as exc:
-            return f"batch_{i}", None, f"{type(exc).__name__}: {exc}", ""
+            return f"batch_{i}", None, _call_error(exc), ""
         parsed = _parse_response(raw)
         _record(usage, parsed)
+        if strict:
+            problem = _reply_problem(parsed, unowned_batches[i], LABELS, "")
+            if problem:
+                return f"batch_{i}", None, problem, raw
         return f"batch_{i}", parsed, None, raw
+
+    def guarded(process, owner):
+        if stop.is_set():
+            return None
+        result = process(owner)
+        if strict and result is not None and result[2]:
+            stop.set()
+        return result
+
+    char_index = {cid: i for i, cid in enumerate(chars)}
+    org_index = {grp: i for i, grp in enumerate(org_groups)}
+
+    def owner_label(kind: str, owner) -> str:
+        if kind == "char":
+            return f"character {char_index[owner] + 1} of {len(chars)}"
+        if kind == "org":
+            return f"org group {org_index[owner] + 1} of {len(org_groups)}"
+        return f"unowned batch {owner + 1} of {len(unowned_batches)}"
 
     t0 = time.monotonic()
     print(f"  LLM judge: {len(chars)} characters + {len(org_groups)} org groups + "
@@ -872,19 +1038,22 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     per_character: Dict[str, dict] = {}
     per_org_group: Dict[str, dict] = {}
     per_unowned: Dict[str, dict] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as exe:
-        char_futs = {exe.submit(process_one, cid): ("char", cid) for cid in chars}
-        org_futs = {exe.submit(process_org, grp): ("org", grp) for grp in org_groups}
-        un_futs = {exe.submit(process_unowned, i): ("unowned", i) for i in range(len(unowned_batches))}
+    failure: Optional[JudgeError] = None
+    exe = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        char_futs = {exe.submit(guarded, process_one, cid): ("char", cid) for cid in chars}
+        org_futs = {exe.submit(guarded, process_org, grp): ("org", grp) for grp in org_groups}
+        un_futs = {exe.submit(guarded, process_unowned, i): ("unowned", i) for i in range(len(unowned_batches))}
         all_futs = {**char_futs, **org_futs, **un_futs}
         for n, fut in enumerate(concurrent.futures.as_completed(all_futs), 1):
-            kind, _ = all_futs[fut]
-            key, parsed, err, raw = fut.result()
-            if strict and (err or not _has_verdicts(parsed)):
-                exe.shutdown(wait=False, cancel_futures=True)
-                raise JudgeError(redact_account_ids(
-                    f"{provider} judge call for {kind} {key!r} failed: "
-                    f"{err or 'the response did not parse as a verdict list'}"))
+            kind, owner = all_futs[fut]
+            result = fut.result()
+            if result is None:
+                continue
+            key, parsed, err, raw = result
+            if strict and err:
+                failure = JudgeError(f"{provider} judge call for {owner_label(kind, owner)} failed: {err}")
+                break
             if kind == "unowned":
                 per_unowned[key] = {"mapping": unowned_batches[int(key.split("_")[1])], "raw": raw, "parsed": parsed, "error": err}
             elif kind == "char":
@@ -905,6 +1074,10 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             if n % PROGRESS_EVERY == 0 or n == len(all_futs):
                 dt = time.monotonic() - t0
                 print(f"    {n}/{len(all_futs)} done in {dt:.0f}s")
+    finally:
+        exe.shutdown(wait=failure is None, cancel_futures=failure is not None)
+    if failure is not None:
+        raise failure
 
     # ---- Character tallies: one count per (character, label, surface) bucket
     # ("unique precision") and per-label span totals weighted by how many gold
@@ -968,9 +1141,9 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     org_group_span_totals = {k: sum(v[k] for v in org_by_label_span_totals.values())
                              for k in ("coherent_spans", "incoherent_spans", "skipped_spans")}
 
-    return {
-        "provider": provider,
-        "model": redact_account_ids(MODEL),
+    result = {
+        **({"provider": provider} if strict else {}),
+        "model": redact_account_ids(MODEL) if strict else MODEL,
         "usage": {
             "n_calls":          totals["n_calls"],
             "n_parse_failures": totals["n_parse_failures"],
@@ -994,3 +1167,8 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         "unowned_incoherent_verdicts": unowned_incoherent_verdicts,
         "per_unowned":           per_unowned,
     }
+    if strict:
+        n_skipped, n_pairs = pair_counts(result)
+        if n_skipped == n_pairs:
+            raise JudgeError(f"{provider} judge left all {n_pairs} pairs unjudged")
+    return result
