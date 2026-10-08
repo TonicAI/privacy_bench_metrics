@@ -29,33 +29,15 @@ for that file; the only exclusion is the handful of PDF spans the renderer clipp
         --run-name     aaron_pfizer_my_pipeline [--judge-model claude-opus-5] [--skip-llm-judge]
 
 The judge runs on the Claude API by default (ANTHROPIC_API_KEY; skipped when unset). To run it on Amazon
-Bedrock instead, with credentials from the standard AWS chain:
+Bedrock instead (see the README):
 
         --judge-provider bedrock --judge-model global.anthropic.claude-opus-5-5 [--judge-region us-east-1]
-
-With bedrock, --judge-model is required, the region defaults to AWS_REGION, then AWS_DEFAULT_REGION, and
-AWS_BEARER_TOKEN_BEDROCK, when set, takes precedence over the AWS credential chain. A judge call that fails with
-a throttling, overloaded, timeout, 5xx or connection error, including partway through its stream, is retried
-with backoff; the SDK's own retries are off, so a judge call sends at most 5 HTTP requests. Auth, validation
-and access-denied errors are not retried. Missing credentials, a call that still fails, a reply that does not
-parse, has a malformed verdict for one of its pairs or judges none of them, or a run with every pair unjudged
-exits non-zero. The run is built in a hidden sibling of the run directory, created before the judge starts, so
-an unusable --runs-dir fails before any judge call; it is renamed into place only once everything is written,
-and never over an existing entry, so a failed, interrupted or terminated (SIGTERM) run leaves nothing behind.
-Only a process killed outright (SIGKILL, the OOM killer) leaves its hidden `.<run-name>.partial-*` dir. Verdicts for pairs outside their call are dropped and counted, and pairs
-left out of an otherwise valid reply count as skipped; the run prints both counts.
 """
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
-import os
-import secrets
-import shutil
-import signal
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -111,78 +93,6 @@ def render_by_kind(by_kind: Dict[str, dict], diag: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _staging_dir(out_dir: Path) -> Path:
-    """A fresh hidden sibling of ``out_dir`` to build the run in, with the mode ``out_dir.mkdir()`` would give it;
-    exits when ``out_dir``'s parent cannot hold it."""
-    try:
-        out_dir.parent.mkdir(parents=True, exist_ok=True)
-        while True:
-            staging = out_dir.parent / f".{out_dir.name}.partial-{secrets.token_hex(4)}"
-            try:
-                staging.mkdir()
-                return staging
-            except FileExistsError:
-                continue
-    except OSError as exc:
-        sys.exit(f"cannot write the run dir under {out_dir.parent}: {exc.strerror or type(exc).__name__}")
-
-
-def _publish(staging: Path, out_dir: Path) -> None:
-    """Rename ``staging`` to ``out_dir``, refusing when anything already has that name, even an empty directory:
-    the name is first claimed with ``mkdir``, which fails on any existing entry, and the rename replaces only the
-    empty directory just claimed."""
-    refusal = f"refusing to overwrite existing run dir: {out_dir}"
-    try:
-        out_dir.mkdir()
-    except FileExistsError:
-        sys.exit(refusal)
-    except OSError as exc:
-        sys.exit(f"cannot write the run dir {out_dir}: {exc.strerror or type(exc).__name__}")
-    try:
-        os.rename(staging, out_dir)
-    except BaseException as exc:
-        with contextlib.suppress(OSError):
-            out_dir.rmdir()
-        if isinstance(exc, OSError):
-            sys.exit(refusal)
-        raise
-
-
-def _exit_on_sigterm(signum, _frame):
-    raise SystemExit(128 + signum)
-
-
-@contextlib.contextmanager
-def _sigterm_unwinds():
-    """While active, SIGTERM raises SystemExit(143) in the main thread, so ``finally`` blocks still run."""
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    previous = signal.signal(signal.SIGTERM, _exit_on_sigterm)
-    try:
-        yield
-    finally:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
-
-
-def resolve_judge(ap: argparse.ArgumentParser, args: argparse.Namespace) -> Optional[str]:
-    """Validate the judge flags; returns the bedrock region (None for the anthropic provider).
-    Exits through ``ap.error`` on an invalid combination."""
-    if args.judge_provider != score_realism_llm.PROVIDER_BEDROCK:
-        if args.judge_region:
-            ap.error("--judge-region applies only to --judge-provider bedrock")
-        return None
-    if args.skip_llm_judge:
-        ap.error("--judge-provider bedrock requests the judge; it cannot be combined with --skip-llm-judge")
-    if not args.judge_model:
-        ap.error("--judge-model is required with --judge-provider bedrock "
-                 "(a Bedrock model or inference-profile id or ARN, e.g. global.anthropic.claude-opus-5-5)")
-    region = args.judge_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    if not region:
-        ap.error("--judge-provider bedrock needs a region: pass --judge-region or set AWS_REGION / AWS_DEFAULT_REGION")
-    return region
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--predictions", required=True, type=Path, help="pipeline output JSONL: {file, spans[...]} per file unit")
@@ -201,7 +111,8 @@ def main() -> int:
     ap.add_argument("--skip-llm-judge", action="store_true", help="NER recall only (offline, no API key)")
     ap.add_argument("--overlap", type=float, default=native.MATCH_THRESHOLD, help="minimum native-coordinate overlap for a match")
     args = ap.parse_args()
-    judge_region = resolve_judge(ap, args)
+    if args.judge_provider == score_realism_llm.PROVIDER_BEDROCK and not args.judge_model:
+        ap.error("--judge-model is required with --judge-provider bedrock")
     if args.judge_model:
         score_realism_llm.MODEL = args.judge_model
     for p in (args.predictions, args.ground_truth):
@@ -209,31 +120,10 @@ def main() -> int:
             sys.exit(f"missing file: {p}")
     if not args.skip_llm_judge and not args.characters:
         sys.exit("--characters is required for synthesis accuracy; pass --skip-llm-judge for recall only")
-    if judge_region is not None:
-        problem = score_realism_llm.bedrock_credentials_problem(judge_region)
-        if problem:
-            sys.exit(f"bedrock judge unavailable: {problem}")
     out_dir = args.runs_dir / args.run_name
     if out_dir.exists():
         sys.exit(f"refusing to overwrite existing run dir: {out_dir}")
-    bedrock = judge_region is not None
-    if not bedrock:
-        out_dir.mkdir(parents=True)
-        return _run(args, out_dir, None, judge_region)
-    with _sigterm_unwinds():
-        staging = None
-        try:
-            staging = _staging_dir(out_dir)
-            return _run(args, out_dir, staging, judge_region)
-        finally:
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-
-
-def _run(args: argparse.Namespace, out_dir: Path, staging: Optional[Path], judge_region: Optional[str]) -> int:
-    bedrock = judge_region is not None
-    work_dir = staging if bedrock else out_dir
-    judge_model = score_realism_llm.redact_account_ids(score_realism_llm.MODEL) if bedrock else score_realism_llm.MODEL
+    out_dir.mkdir(parents=True)
 
     characters = load_characters(args.characters) if args.characters else None
     print(f"loading predictions from {args.predictions} ...")
@@ -258,13 +148,10 @@ def _run(args: argparse.Namespace, out_dir: Path, staging: Optional[Path], judge
     if args.skip_llm_judge:
         realism_llm = {"skipped_reason": "--skip-llm-judge", "per_character": {}, "overall": {"coherent": 0, "incoherent": 0, "skipped": 0}}
     else:
-        print(f"LLM judge ({args.judge_provider}: {judge_model}) ..." if bedrock else f"LLM judge ({judge_model}) ...")
+        print(f"LLM judge ({args.judge_provider}: {score_realism_llm.MODEL}) ...")
         t = time.monotonic()
-        try:
-            realism_llm = score_realism_llm.score(rows, characters=characters, workers=args.workers,
-                                                  provider=args.judge_provider, region=judge_region)
-        except score_realism_llm.JudgeError as exc:
-            sys.exit(f"LLM judge failed, no results written: {exc}")
+        realism_llm = score_realism_llm.score(rows, characters=characters, workers=args.workers,
+                                              provider=args.judge_provider, region=args.judge_region)
         timings["realism_llm"] = time.monotonic() - t
     t = time.monotonic()
     grouping = score_grouping.score(rows)
@@ -276,28 +163,25 @@ def _run(args: argparse.Namespace, out_dir: Path, staging: Optional[Path], judge
     print(f"\nscores — ner_recall={_p(o['ner_recall'])}  synthesis_accuracy={_p(o['synthesis_accuracy'])}  combined={_p(o['combined_accuracy'])}")
     for kind, b in metrics["by_kind"].items():
         print(f"  {kind:10s} recall={_p(b['ner_recall'])}  synthesis={_p(b['synthesis_accuracy'])}  combined={_p(b['combined_accuracy'])}  (gold {b['gold']:,})")
-    if bedrock:
-        n_skipped, n_pairs = score_realism_llm.pair_counts(realism_llm)
+    n_skipped, n_pairs = score_realism_llm.pair_counts(realism_llm)
+    if n_pairs:
         print(f"judge: {n_skipped} of {n_pairs} pairs unjudged ({n_skipped / n_pairs:.1%}), counted as skipped")
-        print(f"judge: {realism_llm['usage']['n_dropped_verdicts']} verdict(s) for pairs outside their call dropped")
 
     results = {
         "config": {"predictions": str(args.predictions), "ground_truth": str(args.ground_truth),
                    "characters": str(args.characters) if args.characters else None, "run_name": args.run_name,
-                   "format": "native", "overlap_threshold": args.overlap, "judge_model": None if args.skip_llm_judge else judge_model,
-                   **({"judge_provider": args.judge_provider, "judge_effort": "default"} if bedrock else {}),
+                   "format": "native", "overlap_threshold": args.overlap, "judge_model": None if args.skip_llm_judge else score_realism_llm.MODEL,
+                   "judge_provider": None if args.skip_llm_judge else args.judge_provider,
                    "n_rows": len(rows), "tier": "entity", "labels": list(LABELS)},
         "timings_sec": timings,
         "metrics": metrics,
         "native_join": diag,
         "detail": {"recall": recall, "consistency": consistency, "realism_rule": realism_rule, "judge": realism_llm, "grouping": grouping},
     }
-    (work_dir / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
-    render(results, work_dir / "summary.md", work_dir / "viewer.html")
-    with open(work_dir / "summary.md", "a", encoding="utf-8") as f:
+    (out_dir / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
+    render(results, out_dir / "summary.md", out_dir / "viewer.html")
+    with open(out_dir / "summary.md", "a", encoding="utf-8") as f:
         f.write(render_by_kind(metrics["by_kind"], diag))
-    if bedrock:
-        _publish(staging, out_dir)
     print(f"\nwrote {out_dir / 'results.json'}\nwrote {out_dir / 'summary.md'}\nwrote {out_dir / 'viewer.html'}")
     return 0
 

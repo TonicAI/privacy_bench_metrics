@@ -51,52 +51,16 @@ the synthesis-accuracy denominator unjudged.
 
 Concurrent via ThreadPoolExecutor (default 8 workers). Prompt cache on the
 system prompt. JSON parse with regex fallback.
-
-Two judge providers:
-  - ``anthropic`` (the default): the direct Claude API, keyed by
-    ANTHROPIC_API_KEY. Without the key the judge is skipped, and a call that
-    fails or does not parse counts its buckets as skipped.
-  - ``bedrock``: Amazon Bedrock through ``anthropic.AnthropicBedrock`` in an
-    explicit region, authenticated by ``AWS_BEARER_TOKEN_BEDROCK`` when it is
-    set and otherwise by the standard AWS credential chain. The SDK's own
-    retries are off, so each judge call sends at most JUDGE_ATTEMPTS (5) HTTP
-    requests: it is retried when it fails with a throttling, overloaded,
-    timeout, 5xx or connection error, including one raised partway through
-    the response stream; an auth, validation or access-denied error is never
-    retried. The four waits back off exponentially from RETRY_BASE_SEC with
-    jitter, about two minutes in all, and each wait is at least the error's
-    ``retry-after-ms`` / ``retry-after`` hint, capped at RETRY_AFTER_CAP_SEC.
-    A read that waits READ_TIMEOUT_SEC for bytes ends the attempt. No read
-    of the response body starts once STREAM_DEADLINE_SEC have passed since
-    the attempt began (the headers are bounded by READ_TIMEOUT_SEC alone),
-    so a reply that keeps trickling bytes or keepalives still ends, but a reply
-    whose ``message_stop`` has arrived is always kept. Both kinds of timeout
-    are retried. ``JudgeError`` is raised, with no partial result,
-    for missing credentials, nothing to judge, a call that still fails, a
-    response that does not parse, a response with a malformed verdict for
-    one of its pairs (no boolean ``coherent``, or a ``values`` that is not a
-    list of ``{value, coherent}`` entries), a response that judges none of
-    its pairs, or a run in which every pair is unjudged. Only the verdicts
-    for a call's own pairs are kept, so the tallies and the metrics read
-    exactly the entries that were checked; a verdict for any other pair, or
-    under a label the call did not ask about, is dropped and counted in
-    ``usage.n_dropped_verdicts``. A pair that a valid response leaves out
-    still counts as skipped, as on the default provider; ``pair_counts``
-    reports how many.
 """
 from __future__ import annotations
 
 import concurrent.futures
-import email.utils
 import json
-import math
 import os
-import random
 import re
 import threading
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from .score_recall import _match_pred
@@ -112,187 +76,11 @@ PROVIDER_BEDROCK = "bedrock"
 PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_BEDROCK)
 
 
-class JudgeError(RuntimeError):
-    """The bedrock judge could not produce a complete result."""
-
-
-_ARN_ACCOUNT_RE = re.compile(r"(arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:)\d{12}(?=:)")
-
-
-def redact_account_ids(text: str) -> str:
-    """``text`` with the account id of every AWS ARN in it replaced, so a model id or an error message is safe
-    to record: an ARN keeps its service, region and resource."""
-    return _ARN_ACCOUNT_RE.sub(r"\1<account>", str(text))
-
-
-def bedrock_credentials_problem(region: Optional[str]) -> Optional[str]:
-    """Why the bedrock judge cannot sign requests, or None when it can.
-
-    Resolves credentials the way ``AnthropicBedrock`` does (a Bedrock bearer
-    token, else the boto3 credential chain) without sending a request."""
-    if not region:
-        return "no AWS region: pass --judge-region or set AWS_REGION / AWS_DEFAULT_REGION"
-    try:
-        import anthropic
-    except ImportError:
-        return "the anthropic package is not installed: pip install 'anthropic[bedrock]'"
-    if not hasattr(anthropic, "AnthropicBedrock"):
-        return "this anthropic package has no AnthropicBedrock client: pip install -U 'anthropic[bedrock]'"
-    if os.environ.get("AWS_BEARER_TOKEN_BEDROCK"):
-        return None
-    try:
-        import boto3
-    except ImportError:
-        return "boto3 is not installed: pip install 'anthropic[bedrock]'"
-    try:
-        credentials = boto3.Session(region_name=region).get_credentials()
-    except Exception as exc:
-        return f"could not resolve AWS credentials ({type(exc).__name__})"
-    if credentials is None:
-        return "no AWS credentials found in the standard AWS credential chain"
-    return None
-
-
-READ_TIMEOUT_SEC = 300.0
-CONNECT_TIMEOUT_SEC = 10.0
-
-
 def _make_client(provider: str, region: Optional[str]):
     import anthropic
     if provider == PROVIDER_BEDROCK:
-        return anthropic.AnthropicBedrock(aws_region=region, max_retries=0,
-                                          timeout=anthropic.Timeout(READ_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC))
+        return anthropic.AnthropicBedrock(aws_region=region, max_retries=MAX_RETRIES)
     return anthropic.Anthropic(max_retries=MAX_RETRIES)
-
-
-STREAM_DEADLINE_SEC = 900.0
-
-
-class AttemptTimeout(Exception):
-    """A judge attempt whose reply was still streaming STREAM_DEADLINE_SEC after the attempt started."""
-
-
-_RETRYABLE_STREAM_ERRORS = frozenset({
-    "overloaded_error", "rate_limit_error", "api_error", "timeout_error",
-    "throttlingexception", "serviceunavailableexception", "internalserverexception",
-    "modelstreamerrorexception", "modeltimeoutexception",
-})
-_CONNECTION_ERRORS = frozenset({"APIConnectionError", "TransportError"})
-_ERROR_CODE_RE = re.compile(r"[A-Za-z_]{1,64}")
-
-
-def _stream_error_code(exc: BaseException) -> Optional[str]:
-    """The error type an ``error`` event (or a Bedrock exception frame) carried, when it is a plain identifier."""
-    body = getattr(exc, "body", None)
-    err = body.get("error") if isinstance(body, dict) else None
-    code = err.get("type") if isinstance(err, dict) else None
-    return code if isinstance(code, str) and _ERROR_CODE_RE.fullmatch(code) else None
-
-
-def is_retryable(exc: BaseException) -> bool:
-    """Whether a failed judge call is worth retrying: throttling, overloaded, timeout, 5xx and connection errors
-    are; auth, validation, access-denied and every other error are not."""
-    if isinstance(exc, AttemptTimeout):
-        return True
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int) and status != 200:
-        return status in (408, 429) or status >= 500
-    code = _stream_error_code(exc)
-    if code is not None:
-        return code.lower() in _RETRYABLE_STREAM_ERRORS
-    return any(c.__name__ in _CONNECTION_ERRORS for c in type(exc).__mro__)
-
-
-def describe_error(exc: BaseException) -> str:
-    """A failed call named by its exception type, HTTP status and error code only, never its message."""
-    details = []
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int):
-        details.append(f"HTTP {status}")
-    code = _stream_error_code(exc)
-    if code:
-        details.append(code)
-    return type(exc).__name__ + (f" ({', '.join(details)})" if details else "")
-
-
-class _CallFailed(Exception):
-    """A judge call that failed for good; its message is safe to print."""
-
-
-class _Cancelled(Exception):
-    """Another judge call already failed the run."""
-
-
-def _retry_after(exc: BaseException) -> Optional[float]:
-    """The wait, in seconds, that a failed response's ``retry-after-ms`` or ``retry-after`` header asks for."""
-    headers = getattr(getattr(exc, "response", None), "headers", None)
-    if headers is None:
-        return None
-    for name, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
-        value = headers.get(name)
-        if value is None:
-            continue
-        try:
-            seconds = float(value) * scale
-        except (TypeError, ValueError):
-            if name == "retry-after-ms":
-                continue
-            try:
-                when = email.utils.parsedate_to_datetime(value)
-            except (TypeError, ValueError, IndexError, OverflowError):
-                continue
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=timezone.utc)
-            seconds = (when - datetime.now(timezone.utc)).total_seconds()
-        if math.isfinite(seconds):
-            return max(0.0, seconds)
-    return None
-
-
-JUDGE_ATTEMPTS = 5
-RETRY_BASE_SEC = 8.0
-RETRY_JITTER = 0.25
-RETRY_AFTER_CAP_SEC = 60.0
-
-
-def _retry_delay(attempt: int, exc: BaseException) -> float:
-    """The wait after failed attempt ``attempt``: 8, 16, 32 and 64 s (two minutes in all) give or take
-    RETRY_JITTER, and never less than the response's retry-after hint, capped at RETRY_AFTER_CAP_SEC."""
-    delay = RETRY_BASE_SEC * 2 ** (attempt - 1) * random.uniform(1 - RETRY_JITTER, 1 + RETRY_JITTER)
-    hint = _retry_after(exc)
-    return delay if hint is None else max(delay, min(hint, RETRY_AFTER_CAP_SEC))
-
-
-def _retry_sleep(stop: threading.Event, delay: float) -> bool:
-    """Back off for ``delay`` seconds; True when ``stop`` was set meanwhile, which ends the wait at once."""
-    return stop.wait(delay)
-
-
-def _call_llm_with_retries(client, system_prompt: str, user_msg: str,
-                           stop: threading.Event) -> Tuple[str, dict]:
-    for attempt in range(1, JUDGE_ATTEMPTS + 1):
-        if stop.is_set():
-            raise _Cancelled()
-        try:
-            return _call_llm(client, system_prompt, user_msg, deadline=time.monotonic() + STREAM_DEADLINE_SEC)
-        except Exception as exc:
-            if stop.is_set():
-                raise _Cancelled() from exc
-            if attempt == JUDGE_ATTEMPTS or not is_retryable(exc):
-                raise _CallFailed(f"{describe_error(exc)} after {attempt} attempt(s)") from exc
-            if _retry_sleep(stop, _retry_delay(attempt, exc)):
-                raise _Cancelled() from exc
-    raise AssertionError("unreachable")
-
-
-def _guarded(stop: threading.Event, strict: bool, process, owner):
-    """Run one owner's judge calls unless the run already failed; a strict failure stops every later call."""
-    if stop.is_set():
-        return None
-    result = process(owner)
-    if strict and result is not None and result[2]:
-        stop.set()
-    return result
 
 # Character-level judging covers every label a character can own; ORGANIZATION
 # is judged per org GROUP, together with the addresses, phones, URLs and
@@ -812,7 +600,7 @@ def _build_org_user_message(grp: str, mapping: Dict[str, Dict[str, List[str]]]) 
     return "\n".join(parts)
 
 
-def _call_llm(client, system_prompt: str, user_msg: str, deadline: Optional[float] = None) -> Tuple[str, dict]:
+def _call_llm(client, system_prompt: str, user_msg: str) -> Tuple[str, dict]:
     with client.messages.stream(
         model=MODEL,
         max_tokens=MAX_TOKENS,
@@ -824,7 +612,7 @@ def _call_llm(client, system_prompt: str, user_msg: str, deadline: Optional[floa
         messages=[{"role": "user", "content": user_msg}],
         thinking={"type": "adaptive"},
     ) as stream:
-        resp = stream.get_final_message() if deadline is None else _final_message_by(stream, deadline)
+        resp = stream.get_final_message()
     text_parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
     raw = "".join(text_parts)
     usage = {
@@ -834,32 +622,6 @@ def _call_llm(client, system_prompt: str, user_msg: str, deadline: Optional[floa
         "cache_read_input_tokens":     getattr(resp.usage, "cache_read_input_tokens", 0)     or 0,
     }
     return raw, usage
-
-
-def _final_message_by(stream, deadline: float):
-    """The streamed message, kept as soon as its ``message_stop`` event arrives, however late that is. No read of
-    the response body starts after ``deadline``, so a stream whose bytes or keepalives keep arriving without
-    completing the reply still ends: within one read of the deadline, which READ_TIMEOUT_SEC bounds."""
-    response = stream.response
-    iter_bytes = response.iter_bytes
-    response.iter_bytes = lambda *args, **kwargs: _reads_before(iter_bytes(*args, **kwargs), deadline)
-    for event in stream:
-        if event.type == "message_stop":
-            return stream.current_message_snapshot
-    return stream.get_final_message()
-
-
-def _reads_before(chunks, deadline: float):
-    """``chunks`` as they arrive, raising AttemptTimeout rather than starting a read after ``deadline``."""
-    chunks = iter(chunks)
-    while True:
-        if time.monotonic() > deadline:
-            raise AttemptTimeout()
-        try:
-            chunk = next(chunks)
-        except StopIteration:
-            return
-        yield chunk
 
 
 def _char_orgs(characters: Optional[dict], cid: str) -> List[str]:
@@ -917,48 +679,6 @@ def _tally(mapping: Dict[str, Dict[str, List[str]]], counts: Dict[str, Dict[str,
                 })
 
 
-def _has_verdicts(parsed: Optional[dict]) -> bool:
-    return isinstance(parsed, dict) and isinstance(parsed.get("verdicts"), list)
-
-
-def _matching_verdicts(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
-                       allowed: Tuple[str, ...], default_label: str) -> List[Tuple[Tuple[str, str], dict]]:
-    """The reply's verdict entries that name one of ``mapping``'s (label, surface) pairs, matched the way the
-    tallies match."""
-    verdicts = parsed.get("verdicts") if isinstance(parsed, dict) else None
-    if not isinstance(verdicts, list):
-        return []
-    out = []
-    for entry in verdicts:
-        if isinstance(entry, dict) and isinstance(entry.get("surface"), str):
-            lab = _verdict_label(entry, default_label)
-            if lab in allowed and entry["surface"] in (mapping.get(lab) or {}):
-                out.append(((lab, entry["surface"]), entry))
-    return out
-
-
-def _well_formed(entry: dict) -> bool:
-    """A verdict the tallies can read without coercion: a boolean ``coherent`` and, when present, a ``values``
-    list of ``{value: str, coherent: bool}`` entries."""
-    if not isinstance(entry.get("coherent"), bool):
-        return False
-    values = entry.get("values")
-    return values is None or (isinstance(values, list) and all(
-        isinstance(vv, dict) and isinstance(vv.get("value"), str) and isinstance(vv.get("coherent"), bool)
-        for vv in values))
-
-
-def _judged_pairs(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
-                  allowed: Tuple[str, ...], default_label: str) -> int:
-    """How many of ``mapping``'s pairs a parsed reply judges; ``_reply_problem`` has already failed any reply
-    whose verdict for one of them is not a boolean."""
-    return len({pair for pair, _ in _matching_verdicts(parsed, mapping, allowed, default_label)})
-
-
-def _n_pairs(mapping: Dict[str, Dict[str, List[str]]]) -> int:
-    return sum(len(sub) for sub in mapping.values())
-
-
 def pair_counts(result: dict) -> Tuple[int, int]:
     """(unjudged pairs, all pairs) over a judge result's character, org-group and unowned tallies."""
     skipped = total = 0
@@ -967,29 +687,6 @@ def pair_counts(result: dict) -> Tuple[int, int]:
             skipped += t.get("skipped", 0)
             total += t.get("coherent", 0) + t.get("incoherent", 0) + t.get("skipped", 0)
     return skipped, total
-
-
-def _in_scope(parsed: dict, mapping: Dict[str, Dict[str, List[str]]], allowed: Tuple[str, ...],
-              default_label: str) -> Tuple[dict, int]:
-    """A checked reply cut down to its verdicts for ``mapping``'s pairs, the entries ``_reply_problem`` checked,
-    and how many other entries it dropped."""
-    matching = _matching_verdicts(parsed, mapping, allowed, default_label)
-    return {"verdicts": [entry for _, entry in matching]}, len(parsed["verdicts"]) - len(matching)
-
-
-def _reply_problem(parsed: Optional[dict], mapping: Dict[str, Dict[str, List[str]]],
-                   allowed: Tuple[str, ...], default_label: str) -> Optional[str]:
-    """Why a bedrock reply cannot be used, or None; names counts only, never the pairs."""
-    if not _has_verdicts(parsed):
-        return "the response did not parse as a verdict list"
-    matching = _matching_verdicts(parsed, mapping, allowed, default_label)
-    malformed = sum(1 for _, entry in matching if not _well_formed(entry))
-    if malformed:
-        return (f"{malformed} of the response's {len(matching)} verdicts for its pairs are malformed "
-                f"(no boolean coherent, or values not a list of {{value, coherent}} entries)")
-    if _judged_pairs(parsed, mapping, allowed, default_label) == 0:
-        return f"the response judged none of its {_n_pairs(mapping)} pairs"
-    return None
 
 
 def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
@@ -1004,21 +701,8 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     character's employer organization + its synthetic mapping into the
     character prompt so the judge can check email-domain ↔ synthetic-org
     consistency.
-
-    ``provider`` is ``"anthropic"`` (the direct API) or ``"bedrock"``
-    (``AnthropicBedrock`` in ``region``). The bedrock judge retries a call
-    that fails with a retryable error, and raises ``JudgeError`` instead of
-    returning a skipped result, a failed call or a reply that judges none of
-    its pairs; pairs left out of an otherwise valid reply count as skipped.
     """
-    if provider not in PROVIDERS:
-        raise ValueError(f"unknown judge provider: {provider!r}")
-    strict = provider == PROVIDER_BEDROCK
-    if strict:
-        problem = bedrock_credentials_problem(region)
-        if problem:
-            raise JudgeError(problem)
-    elif not os.environ.get("ANTHROPIC_API_KEY"):
+    if provider == PROVIDER_ANTHROPIC and not os.environ.get("ANTHROPIC_API_KEY"):
         return {
             "skipped_reason": "ANTHROPIC_API_KEY not set",
             "per_character": {},
@@ -1032,8 +716,6 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     chars = sorted(mappings)
     org_groups = sorted(org_mappings)
     if not chars and not org_groups and not unowned_batches:
-        if strict:
-            raise JudgeError("nothing to judge: no detected span carries a synthetic value")
         return {
             "skipped_reason": "no characters with synthetic values",
             "per_character": {},
@@ -1042,12 +724,11 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         }
 
     client = _make_client(provider, region)
-    stop = threading.Event()
 
     metrics_lock = threading.Lock()
     totals = {"input_tokens": 0, "output_tokens": 0,
               "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
-              "n_calls": 0, "n_parse_failures": 0, "n_dropped_verdicts": 0}
+              "n_calls": 0, "n_parse_failures": 0}
 
     def _record(usage, parsed):
         with metrics_lock:
@@ -1058,21 +739,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             if parsed is None:
                 totals["n_parse_failures"] += 1
 
-    def _keep_in_scope(parsed, mapping, allowed, default_label) -> dict:
-        kept, dropped = _in_scope(parsed, mapping, allowed, default_label)
-        with metrics_lock:
-            totals["n_dropped_verdicts"] += dropped
-        return kept
-
-    def _call(system_prompt: str, user_msg: str) -> Tuple[str, dict]:
-        if strict:
-            return _call_llm_with_retries(client, system_prompt, user_msg, stop)
-        return _call_llm(client, system_prompt, user_msg)
-
-    def _call_error(exc: Exception) -> str:
-        return str(exc) if isinstance(exc, _CallFailed) else f"{type(exc).__name__}: {exc}"
-
-    def process_one(cid: str) -> Optional[Tuple[str, Optional[dict], Optional[str], str]]:
+    def process_one(cid: str) -> Tuple[str, Optional[dict], Optional[str], str]:
         # Organization context: the character's employer(s) and the
         # synthetic org(s) each was mapped to across the corpus.
         org_ctx: List[Tuple[str, List[str]]] = []
@@ -1083,21 +750,14 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         user_msg = _build_user_message(cid, mappings[cid],
                                        org_context=org_ctx or None)
         try:
-            raw, usage = _call(SYSTEM_PROMPT, user_msg)
-        except _Cancelled:
-            return None
+            raw, usage = _call_llm(client, SYSTEM_PROMPT, user_msg)
         except Exception as exc:
-            return cid, None, _call_error(exc), ""
+            return cid, None, f"{type(exc).__name__}: {exc}", ""
         parsed = _parse_response(raw)
         _record(usage, parsed)
-        if strict:
-            problem = _reply_problem(parsed, mappings[cid], CHAR_LABELS, "")
-            if problem:
-                return cid, None, problem, raw
-            parsed = _keep_in_scope(parsed, mappings[cid], CHAR_LABELS, "")
         return cid, parsed, None, raw
 
-    def process_org(grp: str) -> Optional[Tuple[str, Optional[dict], Optional[str], str]]:
+    def process_org(grp: str) -> Tuple[str, Optional[dict], Optional[str], str]:
         # A dominant org (a corpus protagonist's employer) can carry more surface buckets than
         # one MAX_TOKENS response can hold — the verdict JSON truncates mid-list and the whole
         # group used to count as skipped. Chunk the group's buckets across calls and merge.
@@ -1116,61 +776,31 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         verdicts: List[dict] = []
         raws: List[str] = []
         first_error: Optional[str] = None
-        for n_chunk, piece in enumerate(chunks):
+        for piece in chunks:
             user_msg = _build_org_user_message(grp, piece)
             try:
-                raw, usage = _call(ORG_SYSTEM_PROMPT, user_msg)
-            except _Cancelled:
-                return None
+                raw, usage = _call_llm(client, ORG_SYSTEM_PROMPT, user_msg)
             except Exception as exc:
-                if strict:
-                    first_error = f"chunk {n_chunk + 1} of {len(chunks)}: {_call_error(exc)}"
-                    break
                 first_error = first_error or f"{type(exc).__name__}: {exc}"
                 continue
             parsed = _parse_response(raw)
             _record(usage, parsed)
             raws.append(raw)
-            if strict:
-                problem = _reply_problem(parsed, piece, ORG_LABELS, "ORGANIZATION")
-                if problem:
-                    first_error = f"chunk {n_chunk + 1} of {len(chunks)}: {problem}"
-                    break
-                parsed = _keep_in_scope(parsed, piece, ORG_LABELS, "ORGANIZATION")
             if parsed and isinstance(parsed.get("verdicts"), list):
                 verdicts.extend(parsed["verdicts"])
-        if strict and first_error:
-            return grp, None, first_error, "\n".join(raws)
         if not verdicts:
             return grp, None, first_error or "no chunk parsed", "\n".join(raws)
         return grp, {"verdicts": verdicts}, None, "\n".join(raws)
 
-    def process_unowned(i: int) -> Optional[Tuple[str, Optional[dict], Optional[str], str]]:
+    def process_unowned(i: int) -> Tuple[str, Optional[dict], Optional[str], str]:
         user_msg = _build_unowned_user_message(unowned_batches[i])
         try:
-            raw, usage = _call(UNOWNED_SYSTEM_PROMPT, user_msg)
-        except _Cancelled:
-            return None
+            raw, usage = _call_llm(client, UNOWNED_SYSTEM_PROMPT, user_msg)
         except Exception as exc:
-            return f"batch_{i}", None, _call_error(exc), ""
+            return f"batch_{i}", None, f"{type(exc).__name__}: {exc}", ""
         parsed = _parse_response(raw)
         _record(usage, parsed)
-        if strict:
-            problem = _reply_problem(parsed, unowned_batches[i], LABELS, "")
-            if problem:
-                return f"batch_{i}", None, problem, raw
-            parsed = _keep_in_scope(parsed, unowned_batches[i], LABELS, "")
         return f"batch_{i}", parsed, None, raw
-
-    char_index = {cid: i for i, cid in enumerate(chars)}
-    org_index = {grp: i for i, grp in enumerate(org_groups)}
-
-    def owner_label(kind: str, owner) -> str:
-        if kind == "char":
-            return f"character {char_index[owner] + 1} of {len(chars)}"
-        if kind == "org":
-            return f"org group {org_index[owner] + 1} of {len(org_groups)}"
-        return f"unowned batch {owner + 1} of {len(unowned_batches)}"
 
     t0 = time.monotonic()
     print(f"  LLM judge: {len(chars)} characters + {len(org_groups)} org groups + "
@@ -1178,23 +808,14 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     per_character: Dict[str, dict] = {}
     per_org_group: Dict[str, dict] = {}
     per_unowned: Dict[str, dict] = {}
-    failure: Optional[JudgeError] = None
-    aborted = False
-    exe = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-    try:
-        char_futs = {exe.submit(_guarded, stop, strict, process_one, cid): ("char", cid) for cid in chars}
-        org_futs = {exe.submit(_guarded, stop, strict, process_org, grp): ("org", grp) for grp in org_groups}
-        un_futs = {exe.submit(_guarded, stop, strict, process_unowned, i): ("unowned", i) for i in range(len(unowned_batches))}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as exe:
+        char_futs = {exe.submit(process_one, cid): ("char", cid) for cid in chars}
+        org_futs = {exe.submit(process_org, grp): ("org", grp) for grp in org_groups}
+        un_futs = {exe.submit(process_unowned, i): ("unowned", i) for i in range(len(unowned_batches))}
         all_futs = {**char_futs, **org_futs, **un_futs}
         for n, fut in enumerate(concurrent.futures.as_completed(all_futs), 1):
-            kind, owner = all_futs[fut]
-            result = fut.result()
-            if result is None:
-                continue
-            key, parsed, err, raw = result
-            if strict and err:
-                failure = JudgeError(f"{provider} judge call for {owner_label(kind, owner)} failed: {err}")
-                break
+            kind, _ = all_futs[fut]
+            key, parsed, err, raw = fut.result()
             if kind == "unowned":
                 per_unowned[key] = {"mapping": unowned_batches[int(key.split("_")[1])], "raw": raw, "parsed": parsed, "error": err}
             elif kind == "char":
@@ -1215,16 +836,6 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             if n % PROGRESS_EVERY == 0 or n == len(all_futs):
                 dt = time.monotonic() - t0
                 print(f"    {n}/{len(all_futs)} done in {dt:.0f}s")
-    except BaseException:
-        if strict:
-            aborted = True
-            stop.set()
-        raise
-    finally:
-        abort = aborted or failure is not None
-        exe.shutdown(wait=not abort, cancel_futures=abort)
-    if failure is not None:
-        raise failure
 
     # ---- Character tallies: one count per (character, label, surface) bucket
     # ("unique precision") and per-label span totals weighted by how many gold
@@ -1288,9 +899,9 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     org_group_span_totals = {k: sum(v[k] for v in org_by_label_span_totals.values())
                              for k in ("coherent_spans", "incoherent_spans", "skipped_spans")}
 
-    result = {
-        **({"provider": provider} if strict else {}),
-        "model": redact_account_ids(MODEL) if strict else MODEL,
+    return {
+        "provider": provider,
+        "model": MODEL,
         "usage": {
             "n_calls":          totals["n_calls"],
             "n_parse_failures": totals["n_parse_failures"],
@@ -1298,7 +909,6 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             "output_tokens":    totals["output_tokens"],
             "cache_read_input_tokens":     totals["cache_read_input_tokens"],
             "cache_creation_input_tokens": totals["cache_creation_input_tokens"],
-            **({"n_dropped_verdicts": totals["n_dropped_verdicts"]} if strict else {}),
         },
         "per_label_totals":      per_label_totals,
         "per_label_span_totals": per_label_span_totals,
@@ -1315,8 +925,3 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
         "unowned_incoherent_verdicts": unowned_incoherent_verdicts,
         "per_unowned":           per_unowned,
     }
-    if strict:
-        n_skipped, n_pairs = pair_counts(result)
-        if n_skipped == n_pairs:
-            raise JudgeError(f"{provider} judge left all {n_pairs} pairs unjudged")
-    return result
