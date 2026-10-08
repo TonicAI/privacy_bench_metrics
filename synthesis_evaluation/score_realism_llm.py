@@ -68,7 +68,19 @@ from .types import EvalRow, LABELS, ORG_LABELS, PERSON_LABELS
 
 MODEL = "claude-opus-4-7"
 MAX_TOKENS = 12_000          # adaptive thinking shares this budget with the verdict list
+MAX_RETRIES = 6
 PROGRESS_EVERY = 8
+
+PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_BEDROCK = "bedrock"
+PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_BEDROCK)
+
+
+def _make_client(provider: str, region: Optional[str]):
+    import anthropic
+    if provider == PROVIDER_BEDROCK:
+        return anthropic.AnthropicBedrock(aws_region=region, max_retries=MAX_RETRIES)
+    return anthropic.Anthropic(max_retries=MAX_RETRIES)
 
 # Character-level judging covers every label a character can own; ORGANIZATION
 # is judged per org GROUP, together with the addresses, phones, URLs and
@@ -667,8 +679,19 @@ def _tally(mapping: Dict[str, Dict[str, List[str]]], counts: Dict[str, Dict[str,
                 })
 
 
+def pair_counts(result: dict) -> Tuple[int, int]:
+    """(unjudged pairs, all pairs) over a judge result's character, org-group and unowned tallies."""
+    skipped = total = 0
+    for section in ("per_label_totals", "org_by_label_totals", "unowned_by_label_totals"):
+        for t in (result.get(section) or {}).values():
+            skipped += t.get("skipped", 0)
+            total += t.get("coherent", 0) + t.get("incoherent", 0) + t.get("skipped", 0)
+    return skipped, total
+
+
 def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
-          workers: int = 8) -> dict:
+          workers: int = 8, provider: str = PROVIDER_ANTHROPIC,
+          region: Optional[str] = None) -> dict:
     """Run the LLM judge over every owner with synth data: one call per
     character (one verdict per (label, surface) pair over everything the
     character owns) and one call per organization group (one verdict per
@@ -679,7 +702,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
     character prompt so the judge can check email-domain ↔ synthetic-org
     consistency.
     """
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if provider == PROVIDER_ANTHROPIC and not os.environ.get("ANTHROPIC_API_KEY"):
         return {
             "skipped_reason": "ANTHROPIC_API_KEY not set",
             "per_character": {},
@@ -700,8 +723,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
             "per_label_span_totals": {},
         }
 
-    import anthropic
-    client = anthropic.Anthropic(max_retries=6)
+    client = _make_client(provider, region)
 
     metrics_lock = threading.Lock()
     totals = {"input_tokens": 0, "output_tokens": 0,
@@ -878,6 +900,7 @@ def score(rows: List[EvalRow], *, characters: Optional[dict] = None,
                              for k in ("coherent_spans", "incoherent_spans", "skipped_spans")}
 
     return {
+        "provider": provider,
         "model": MODEL,
         "usage": {
             "n_calls":          totals["n_calls"],

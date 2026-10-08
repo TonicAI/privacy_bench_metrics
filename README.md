@@ -122,6 +122,20 @@ python -m synthesis_evaluation.run_eval_native \
   --run-name     aaron_pfizer_my_pipeline [--judge-model claude-opus-5] [--skip-llm-judge]
 ```
 
+To run the judge on Amazon Bedrock instead of the Claude API, install
+`anthropic[bedrock]` and add:
+
+```bash
+  --judge-provider bedrock --judge-model global.anthropic.claude-opus-5-5 [--judge-region us-east-1]
+```
+
+`--judge-model` is required there (a Bedrock model or inference-profile id or
+ARN) and the region defaults to `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+`AWS_BEARER_TOKEN_BEDROCK`, when set, takes precedence; otherwise credentials
+come from the standard AWS chain. `ANTHROPIC_API_KEY` is not read. The calls
+stream, so the caller needs `bedrock:InvokeModelWithResponseStream` on the
+inference profile and the foundation models it routes to.
+
 Each gold span is matched to the predicted span of the same file unit that
 overlaps it most in native coordinates (at least half of the union) and carries
 its label; the matched replacement then goes through the same recall, LLM-judge

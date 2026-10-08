@@ -27,6 +27,11 @@ for that file; the only exclusion is the handful of PDF spans the renderer clipp
         --ground-truth $DATA/ground_truth/aaron_pfizer/ground_truth.jsonl \\
         --characters   $DATA/ground_truth/aaron_pfizer/characters.json \\
         --run-name     aaron_pfizer_my_pipeline [--judge-model claude-opus-5] [--skip-llm-judge]
+
+The judge runs on the Claude API by default (ANTHROPIC_API_KEY; skipped when unset). To run it on Amazon
+Bedrock instead (see the README):
+
+        --judge-provider bedrock --judge-model global.anthropic.claude-opus-5-5 [--judge-region us-east-1]
 """
 from __future__ import annotations
 
@@ -96,10 +101,18 @@ def main() -> int:
     ap.add_argument("--run-name", required=True)
     ap.add_argument("--runs-dir", type=Path, default=RUNS_DIR)
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--judge-model", default=None, help=f"LLM judge model id (default {score_realism_llm.MODEL})")
+    ap.add_argument("--judge-provider", choices=score_realism_llm.PROVIDERS, default=score_realism_llm.PROVIDER_ANTHROPIC,
+                    help="where the LLM judge runs: the Claude API (default) or Amazon Bedrock")
+    ap.add_argument("--judge-model", default=None,
+                    help=f"LLM judge model id (default {score_realism_llm.MODEL}); required with --judge-provider bedrock, "
+                         "where it is a Bedrock model or inference-profile id or ARN")
+    ap.add_argument("--judge-region", default=None,
+                    help="AWS region for --judge-provider bedrock (default AWS_REGION, then AWS_DEFAULT_REGION)")
     ap.add_argument("--skip-llm-judge", action="store_true", help="NER recall only (offline, no API key)")
     ap.add_argument("--overlap", type=float, default=native.MATCH_THRESHOLD, help="minimum native-coordinate overlap for a match")
     args = ap.parse_args()
+    if args.judge_provider == score_realism_llm.PROVIDER_BEDROCK and not args.judge_model:
+        ap.error("--judge-model is required with --judge-provider bedrock")
     if args.judge_model:
         score_realism_llm.MODEL = args.judge_model
     for p in (args.predictions, args.ground_truth):
@@ -135,9 +148,10 @@ def main() -> int:
     if args.skip_llm_judge:
         realism_llm = {"skipped_reason": "--skip-llm-judge", "per_character": {}, "overall": {"coherent": 0, "incoherent": 0, "skipped": 0}}
     else:
-        print(f"LLM judge ({score_realism_llm.MODEL}) ...")
+        print(f"LLM judge ({args.judge_provider}: {score_realism_llm.MODEL}) ...")
         t = time.monotonic()
-        realism_llm = score_realism_llm.score(rows, characters=characters, workers=args.workers)
+        realism_llm = score_realism_llm.score(rows, characters=characters, workers=args.workers,
+                                              provider=args.judge_provider, region=args.judge_region)
         timings["realism_llm"] = time.monotonic() - t
     t = time.monotonic()
     grouping = score_grouping.score(rows)
@@ -149,11 +163,15 @@ def main() -> int:
     print(f"\nscores — ner_recall={_p(o['ner_recall'])}  synthesis_accuracy={_p(o['synthesis_accuracy'])}  combined={_p(o['combined_accuracy'])}")
     for kind, b in metrics["by_kind"].items():
         print(f"  {kind:10s} recall={_p(b['ner_recall'])}  synthesis={_p(b['synthesis_accuracy'])}  combined={_p(b['combined_accuracy'])}  (gold {b['gold']:,})")
+    n_skipped, n_pairs = score_realism_llm.pair_counts(realism_llm)
+    if n_pairs:
+        print(f"judge: {n_skipped} of {n_pairs} pairs unjudged ({n_skipped / n_pairs:.1%}), counted as skipped")
 
     results = {
         "config": {"predictions": str(args.predictions), "ground_truth": str(args.ground_truth),
                    "characters": str(args.characters) if args.characters else None, "run_name": args.run_name,
                    "format": "native", "overlap_threshold": args.overlap, "judge_model": None if args.skip_llm_judge else score_realism_llm.MODEL,
+                   "judge_provider": None if args.skip_llm_judge else args.judge_provider,
                    "n_rows": len(rows), "tier": "entity", "labels": list(LABELS)},
         "timings_sec": timings,
         "metrics": metrics,
