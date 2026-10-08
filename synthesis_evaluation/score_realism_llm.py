@@ -67,8 +67,9 @@ Two judge providers:
     jitter, about two minutes in all, and each wait is at least the error's
     ``retry-after-ms`` / ``retry-after`` hint, capped at RETRY_AFTER_CAP_SEC.
     A read that waits READ_TIMEOUT_SEC for bytes ends the attempt. No read
-    starts once STREAM_DEADLINE_SEC have passed since the attempt began, so
-    a reply that keeps trickling bytes or keepalives still ends, but a reply
+    of the response body starts once STREAM_DEADLINE_SEC have passed since
+    the attempt began (the headers are bounded by READ_TIMEOUT_SEC alone),
+    so a reply that keeps trickling bytes or keepalives still ends, but a reply
     whose ``message_stop`` has arrived is always kept. Both kinds of timeout
     are retried. ``JudgeError`` is raised, with no partial result,
     for missing credentials, nothing to judge, a call that still fails, a

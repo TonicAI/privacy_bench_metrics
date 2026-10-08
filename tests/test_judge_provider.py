@@ -1009,6 +1009,35 @@ class BedrockSigtermTests(JudgeCliTestCase):
         self.assertTrue(all(h is _test_sigterm_handler for h in handlers))
 
 
+@unittest.skipUnless(hasattr(signal, "SIGTERM") and os.name == "posix", "needs POSIX signals")
+class BedrockOffMainThreadTests(JudgeCliTestCase):
+    """R-26: a bedrock run started outside the main thread, where no SIGTERM handler can be installed, still
+    completes and leaves the process's handler alone."""
+
+    def setUp(self):
+        super().setUp()
+        previous = signal.signal(signal.SIGTERM, _test_sigterm_handler)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+
+    def test_a_run_outside_the_main_thread_leaves_sigterm_alone(self):
+        outcome = []
+
+        def run():
+            try:
+                outcome.append(self.run_main(*BEDROCK))
+            except BaseException as exc:
+                outcome.append(exc)
+        worker = threading.Thread(target=run)
+        worker.start()
+        worker.join(timeout=60)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], tuple, outcome[0])
+        code, _, err, _ = outcome[0]
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.run_dir() / "results.json").is_file())
+        self.assertIs(signal.getsignal(signal.SIGTERM), _test_sigterm_handler)
+
+
 class BedrockCancellationTests(JudgeCliTestCase):
     """R-8 and R-13: once a call fails the run, queued work is cancelled, no further request is sent, and score()
     does not wait for calls in flight. Ordering comes from events, not timing."""
@@ -1217,6 +1246,9 @@ class StreamDeadlineTests(unittest.TestCase):
     def test_the_deadline_leaves_room_for_a_full_reply(self):
         self.assertGreaterEqual(score_realism_llm.STREAM_DEADLINE_SEC, score_realism_llm.MAX_TOKENS / 15 + 60)
         self.assertGreater(score_realism_llm.STREAM_DEADLINE_SEC, 2 * score_realism_llm.READ_TIMEOUT_SEC)
+
+    def test_the_deadline_bounds_an_attempt(self):
+        self.assertLessEqual(score_realism_llm.STREAM_DEADLINE_SEC, 1200)
 
     def test_no_read_starts_after_the_deadline(self):
         reads = []

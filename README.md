@@ -159,10 +159,13 @@ Auth, validation and access-denied errors are not retried.
     thinking, the whole `MAX_TOKENS` budget. An idle limit alone cannot end
     an attempt that keeps receiving bytes, and a hung stream can keep
     sending keepalives indefinitely.
-  - *Whole stream: 900 s.* No read of the response starts once 900 s have
-    passed since the attempt began. The check runs before every read of
-    the body, not per event, so bytes or keepalives that never complete an
-    event cannot extend it. A reply whose `message_stop` event has arrived
+  - *Whole stream: 900 s.* No read of the response body starts once 900 s
+    have passed since the attempt began. The check runs before every read
+    of the body, not per event, so bytes or keepalives that never complete
+    an event cannot extend it. The response headers are read before the
+    check is in place, so only the 300 s idle limit applies to them; an
+    endpoint that trickled its headers could hold an attempt open, which
+    Bedrock, sending its headers at once, does not do. A reply whose `message_stop` event has arrived
     is kept however late it is, so a finished reply is never thrown away.
     A reply is at most `MAX_TOKENS` (12,000) output tokens, adaptive
     thinking included, whatever the owner's size; the largest chunk, 25
@@ -171,8 +174,9 @@ Auth, validation and access-denied errors are not retried.
     and the other 100 s covers the time to the first token. Neither speed
     is measured: the docs give no output rate, and M5's first judged run is
     the first measurement.
-- **Worst-case wall time per call.** One attempt takes at most about
-  1,200 s: no read starts after 900 s, and the read in progress then ends
+- **Worst-case wall time per call.** Once its headers have arrived, one
+  attempt takes at most about 1,200 s: no read of the body starts after
+  900 s, and the read in progress then ends
   within its 300 s idle limit. An attempt that receives nothing at all ends
   after about 310 s (10 s to connect, then the 300 s read timeout). So a
   call takes at most 5 × 1,200 + 260 s, about 105 minutes. A call whose
@@ -209,7 +213,11 @@ a run directory on the default provider (what the umask gives). It is
 renamed to the run name only once `results.json`, `summary.md` and
 `viewer.html` are all written, and it is removed on any failure, on Ctrl-C
 and on SIGTERM, which the Bedrock run turns into exit code 143 after
-cleaning up. Only a process killed outright (SIGKILL, the OOM killer) leaves
+cleaning up. The cleanup and the cancelling of queued calls happen at once,
+but the process exits only when every judge call already in flight has
+ended, which the per-attempt limits above bound. A caller that must stop the
+run at a fixed time should follow SIGTERM with SIGKILL after a grace period
+(`timeout -k`); the cleanup has already run by then. Only a process killed outright (SIGKILL, the OOM killer) leaves
 the hidden sibling behind; it does no harm, since a rerun makes a new one
 and checks only the run name. If anything has taken the run name meanwhile,
 even an empty directory or a file, the run exits non-zero with `refusing to
