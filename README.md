@@ -127,6 +127,20 @@ python -m synthesis_evaluation.run_eval_native \
   --run-name     aaron_pfizer_my_pipeline [--judge-model claude-opus-5] [--skip-llm-judge]
 ```
 
+To run the judge on Amazon Bedrock instead of the Claude API, install
+`anthropic[bedrock]` and add:
+
+```bash
+  --judge-provider bedrock --judge-model global.anthropic.claude-opus-5-5 [--judge-region us-east-1]
+```
+
+`--judge-model` is required there (a Bedrock model or inference-profile id or
+ARN) and the region defaults to `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+`AWS_BEARER_TOKEN_BEDROCK`, when set, takes precedence; otherwise credentials
+come from the standard AWS chain. `ANTHROPIC_API_KEY` is not read. The calls
+stream, so the caller needs `bedrock:InvokeModelWithResponseStream` on the
+inference profile and the foundation models it routes to.
+
 Each gold span is matched to the predicted span of the same file unit that
 overlaps it most in native coordinates (at least half of the union) and carries
 its label; the matched replacement then goes through the same recall, LLM-judge
@@ -193,15 +207,8 @@ tonic-textual regex`, set `TONIC_TEXTUAL_API_KEY`, and produce the predictions
 with the bundled runner (it prints the Textual server version — the card
 states which version its scores came from). The card's **Textual via SDK**
 rows, messages and document pages alike, apply the graph pipeline's Textual
-configuration expressed in SDK terms (`synthesis_evaluation/textual_config.json`):
-allow lists for ACCOUNT_NUMBER, LOCATION_ADDRESS and ORGANIZATION and the
-username regexes forced server side, an EMAIL_ADDRESS block list, and the
-employee-id regexes applied client side. The ORGANIZATION allow list is the
-graph config's, restricted to the entries whose comment names one of the six
-human-annotated datasets (Coronado and Trimble Fleet Telematics API for
-`nora_caterpillar`, Walmart and Fresh & Value-Added Poultry for
-`renee_tyson_foods`); the config carries two more for datasets without human
-annotations, which never match their text. Message files are filtered to the
+configuration expressed in SDK terms (`synthesis_evaluation/textual_config.json`). 
+Message files are filtered to the
 five original labels automatically; page files keep all ten:
 
 ```bash
@@ -219,11 +226,7 @@ Without `--config` the runner falls back to the plain mode of the earlier
 message-only scores (built-in labels plus the USERNAME allow-list regex, so
 Slack mentions like `<@U02CARLOS>` come back as single bracket-inclusive
 spans); document-page files in the glob are skipped in that mode. Scores
-reproduce to within about a tenth of a point (the Textual service is very
-slightly nondeterministic on borderline detections). Note the config's
-allow-list regexes were derived from the benchmark's generated ground
-truth and, for organizations, from the human gold itself — the card
-carries the same caveat.
+reproduce to within about a tenth of a point.
 
 ### Reproducing the Presidio and GLiNER2 rows
 
