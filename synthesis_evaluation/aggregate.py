@@ -3,8 +3,9 @@
 PrivacyBench has 21 datasets; a pipeline is scored once per dataset with `run_eval` or
 `run_eval_native`. This pools the resulting `results.json` files by summing the gold / detected /
 coherent counts, so the pooled recall, synthesis accuracy and combined accuracy have the same fixed
-denominators as the per-dataset scores (a micro average; the dataset card's baseline table used the
-macro average over datasets, reported here as well).
+denominators as the per-dataset scores (a micro average; the dataset card's baseline table is the
+macro average over datasets, reported here as well — since v2.5 its headline is the macro of the
+per-dataset synthesis + NER accuracy, the geometric mean √(NER recall × synthesis accuracy)).
 
     python -m synthesis_evaluation.aggregate synthesis_evaluation/runs/my_pipeline_* --out my_pipeline_summary.md
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -24,6 +26,7 @@ def _rates(c: Dict[str, int], judged: bool) -> dict:
     out["ner_recall"] = c["detected"] / c["gold"] if c["gold"] else None
     out["synthesis_accuracy"] = (c["coherent"] / c["detected"] if c["detected"] else None) if judged else None
     out["combined_accuracy"] = (c["coherent"] / c["gold"] if c["gold"] else None) if judged else None
+    out["synthesis_ner_accuracy"] = math.sqrt(out["combined_accuracy"]) if out["combined_accuracy"] is not None else None
     return out
 
 
@@ -46,6 +49,10 @@ def aggregate(run_dirs: List[Path]) -> dict:
         for kind, b in (m.get("by_kind") or {}).items():
             _add(by_kind[kind], b)
         per_dataset[d.name] = {k: m["overall"].get(k) for k in ("gold", "ner_recall", "synthesis_accuracy", "combined_accuracy")}
+        # results.json written before v2.5 carries no synthesis_ner_accuracy; derive it
+        comb = per_dataset[d.name]["combined_accuracy"]
+        per_dataset[d.name]["synthesis_ner_accuracy"] = m["overall"].get(
+            "synthesis_ner_accuracy", math.sqrt(comb) if comb is not None else None)
     n = len(per_dataset)
 
     def macro(key: str) -> Optional[float]:
@@ -54,7 +61,7 @@ def aggregate(run_dirs: List[Path]) -> dict:
 
     return {"runs": [str(d) for d in run_dirs], "datasets": n, "judged": judged,
             "overall": _rates(overall, judged),
-            "macro": {k: macro(k) for k in ("ner_recall", "synthesis_accuracy", "combined_accuracy")},
+            "macro": {k: macro(k) for k in ("ner_recall", "synthesis_accuracy", "combined_accuracy", "synthesis_ner_accuracy")},
             "by_label": {lab: _rates(c, judged) for lab, c in sorted(by_label.items())},
             "by_kind": {kind: _rates(c, judged) for kind, c in by_kind.items()},
             "per_dataset": per_dataset}
@@ -67,23 +74,23 @@ def _p(x: Optional[float]) -> str:
 def render(agg: dict) -> str:
     o = agg["overall"]
     lines = [f"# Pooled scores over {agg['datasets']} datasets", "",
-             "| | gold | NER recall | synthesis accuracy | combined |", "|---|---|---|---|---|",
-             f"| pooled (micro) | {o['gold']:,} | {_p(o['ner_recall'])} | {_p(o['synthesis_accuracy'])} | {_p(o['combined_accuracy'])} |",
-             f"| macro over datasets | | {_p(agg['macro']['ner_recall'])} | {_p(agg['macro']['synthesis_accuracy'])} | {_p(agg['macro']['combined_accuracy'])} |", ""]
+             "| | gold | NER recall | synthesis accuracy | combined | synthesis + NER (√) |", "|---|---|---|---|---|---|",
+             f"| pooled (micro) | {o['gold']:,} | {_p(o['ner_recall'])} | {_p(o['synthesis_accuracy'])} | {_p(o['combined_accuracy'])} | {_p(o['synthesis_ner_accuracy'])} |",
+             f"| macro over datasets | | {_p(agg['macro']['ner_recall'])} | {_p(agg['macro']['synthesis_accuracy'])} | {_p(agg['macro']['combined_accuracy'])} | {_p(agg['macro']['synthesis_ner_accuracy'])} |", ""]
     if agg["by_kind"]:
-        lines += ["## By file kind", "", "| kind | gold | NER recall | synthesis accuracy | combined |", "|---|---|---|---|---|"]
+        lines += ["## By file kind", "", "| kind | gold | NER recall | synthesis accuracy | combined | synthesis + NER (√) |", "|---|---|---|---|---|---|"]
         for kind in ("eml", "slack", "pdf", "docx", "xlsx", "csv", "messages", "documents"):
             b = agg["by_kind"].get(kind)
             if b:
-                lines.append(f"| {kind} | {b['gold']:,} | {_p(b['ner_recall'])} | {_p(b['synthesis_accuracy'])} | {_p(b['combined_accuracy'])} |")
+                lines.append(f"| {kind} | {b['gold']:,} | {_p(b['ner_recall'])} | {_p(b['synthesis_accuracy'])} | {_p(b['combined_accuracy'])} | {_p(b['synthesis_ner_accuracy'])} |")
         lines.append("")
-    lines += ["## By label", "", "| label | gold | NER recall | synthesis accuracy | combined |", "|---|---|---|---|---|"]
+    lines += ["## By label", "", "| label | gold | NER recall | synthesis accuracy | combined | synthesis + NER (√) |", "|---|---|---|---|---|---|"]
     for lab, b in agg["by_label"].items():
         if b["gold"]:
-            lines.append(f"| {lab} | {b['gold']:,} | {_p(b['ner_recall'])} | {_p(b['synthesis_accuracy'])} | {_p(b['combined_accuracy'])} |")
-    lines += ["", "## Per dataset", "", "| dataset | gold | NER recall | synthesis accuracy | combined |", "|---|---|---|---|---|"]
+            lines.append(f"| {lab} | {b['gold']:,} | {_p(b['ner_recall'])} | {_p(b['synthesis_accuracy'])} | {_p(b['combined_accuracy'])} | {_p(b['synthesis_ner_accuracy'])} |")
+    lines += ["", "## Per dataset", "", "| dataset | gold | NER recall | synthesis accuracy | combined | synthesis + NER (√) |", "|---|---|---|---|---|---|"]
     for name, v in sorted(agg["per_dataset"].items()):
-        lines.append(f"| {name} | {v['gold']:,} | {_p(v['ner_recall'])} | {_p(v['synthesis_accuracy'])} | {_p(v['combined_accuracy'])} |")
+        lines.append(f"| {name} | {v['gold']:,} | {_p(v['ner_recall'])} | {_p(v['synthesis_accuracy'])} | {_p(v['combined_accuracy'])} | {_p(v['synthesis_ner_accuracy'])} |")
     return "\n".join(lines) + "\n"
 
 

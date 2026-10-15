@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from pathlib import Path
 from typing import Iterable, List
 
@@ -63,7 +64,8 @@ def render_summary(results: dict) -> str:
         ])
         score_rows.append([
             "Synthesis + NER accuracy",
-            _pct_frac(ov["coherent"], ov["gold"]),
+            "—" if ov["gold"] == 0 else
+            f"{_fmt_pct(math.sqrt(ov['coherent'] / ov['gold']))}  (√({ov['coherent']}/{ov['gold']}))",
         ])
     lines.append("| Metric | Score |")
     lines.append("|---|---|")
@@ -76,8 +78,9 @@ def render_summary(results: dict) -> str:
         "Synthesis accuracy = coherently synthesized / detected (an "
         "unchanged value or an incoherent replacement both count "
         "against it; spans the judge failed to evaluate stay in the "
-        "denominator). Synthesis + NER accuracy = coherently "
-        "synthesized / all gold spans — the product of the other two.\n")
+        "denominator). Synthesis + NER accuracy = √(NER recall × "
+        "synthesis accuracy), the geometric mean of the other two — "
+        "equivalently √(coherently synthesized / all gold spans).\n")
 
     # NER recall (detection)
     r = detail["recall"]
