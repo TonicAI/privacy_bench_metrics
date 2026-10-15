@@ -20,12 +20,17 @@ judge's verdicts into one classification per gold span:
                          score)
   combined accuracy    = coherent / gold      (end-to-end; equals
                          NER recall × synthesis accuracy)
+  synthesis + NER      = √(NER recall × synthesis accuracy) — the
+  accuracy               geometric mean of the two stage scores, the
+                         benchmark's headline combined score since
+                         v2.5 (= √combined accuracy)
 
 Each stage's failures land in exactly one metric: a span the NER step
 missed only hurts recall; a detected span left unchanged or replaced
-incoherently only hurts synthesis accuracy; the combined score is
-their product, so a pipeline cannot inflate any column by detecting
-less or by echoing values back unchanged.
+incoherently only hurts synthesis accuracy; the combined scores fold
+both stages in (as their product, and since v2.5 the headline is the
+product's square root), so a pipeline cannot inflate any column by
+detecting less or by echoing values back unchanged.
 
 Also collects identity-mapping diagnostics (which detected spans were
 left unchanged) for the report and viewer, mirroring the recall
@@ -40,6 +45,7 @@ globally only).
 """
 from __future__ import annotations
 
+import math
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -182,12 +188,14 @@ def compute_metrics(rows: List[EvalRow], realism_llm: dict) -> dict:
         out = dict(c)
         out["ner_recall"] = (c["detected"] / c["gold"]) if c["gold"] else None
         if judge_skipped:
-            out["synthesis_accuracy"] = out["combined_accuracy"] = None
+            out["synthesis_accuracy"] = out["combined_accuracy"] = out["synthesis_ner_accuracy"] = None
         else:
             out["synthesis_accuracy"] = (
                 c["coherent"] / c["detected"] if c["detected"] else None)
             out["combined_accuracy"] = (
                 c["coherent"] / c["gold"] if c["gold"] else None)
+            out["synthesis_ner_accuracy"] = (
+                math.sqrt(out["combined_accuracy"]) if out["combined_accuracy"] is not None else None)
         return out
 
     totals = dict.fromkeys(_COUNT_KEYS, 0)

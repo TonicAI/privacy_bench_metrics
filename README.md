@@ -20,15 +20,20 @@ failures land in exactly one column:
    (`new_text` equal to `text` — the value was detected but not
    actually changed) always counts as a miss, and spans the judge
    failed to evaluate stay in the denominator.
-3. **Synthesis + NER accuracy** — the bottom-line, end-to-end score: of
-   all gold PII spans, the fraction that was detected *and* coherently
-   replaced. `coherent / gold`. Equals NER recall × synthesis accuracy,
-   and a pipeline cannot inflate it by detecting less.
+3. **Synthesis + NER accuracy** — the bottom-line, end-to-end score:
+   the geometric mean of the two stage scores,
+   `√(NER recall × synthesis accuracy)` (equivalently
+   `√(coherent / gold)`, since the stage denominators chain). A
+   detection miss and an incoherent replacement both pull it down, and
+   a pipeline cannot inflate it by detecting less. *Changed in v2.5:*
+   before v2.5 this score was the plain product `coherent / gold`; the
+   scorer still reports that as `combined_accuracy` alongside the
+   geometric mean (`synthesis_ner_accuracy`) in `results.json`.
 
 Each stage's failures land in exactly one metric: a span the NER step
 missed only hurts recall, a detected span that was left unchanged or
 replaced incoherently only hurts synthesis accuracy, and the combined
-score is their product.
+score is the geometric mean of the two.
 
 The dataset itself (inputs, ground-truth spans, and character rosters)
 lives on Hugging Face:

@@ -52,6 +52,7 @@ import concurrent.futures
 import glob
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -64,6 +65,14 @@ from .types import ORIGINAL_LABELS
 
 BASE_URL = "https://textual.tonic.ai"
 USERNAME_ALLOW_LIST = {"USERNAME": [r"<@[^>|]+(?:\|[^>]*)?>"]}
+# Bare internal-unit/function/region words are not organizations in the benchmark's
+# convention (only employer-qualified forms like "Boeing HR" are labeled): detections
+# whose whole value is one of these are dropped, in both modes (2026-10-15, from the
+# three-way human-gold audit). Anchored so qualified forms are untouched.
+ORGANIZATION_BLOCK = (r"(?i)^\s*(?:field marketing|hr|ops|poultry|rocky mountain|compliance"
+                      r"|sales operations|group benefits|obesity|national campaigns"
+                      r"|capital markets|medical affairs)\s*[.,;:]?\s*$")
+_ORG_BLOCK_RE = re.compile(ORGANIZATION_BLOCK)
 BATCH_SIZE = 50
 MAX_WORKERS = 4
 LABEL_FOLDS = {"CUSTOM_USERNAME": "USERNAME", "CUSTOM_EMPLOYEE_ID": "EMPLOYEE_ID",
@@ -96,7 +105,7 @@ class TextualRunner:
         self.min_score = min_score
         if config is None:
             self.allow = USERNAME_ALLOW_LIST
-            self.block = None
+            self.block = {"ORGANIZATION": [ORGANIZATION_BLOCK]}
             self.keep = None          # per-file scope decides
             self.employee_id = []
         else:
@@ -104,7 +113,8 @@ class TextualRunner:
             self.allow = {"USERNAME": config["custom_entities"]["username"]["regexes"]}
             # every allow list in the config (ACCOUNT_NUMBER, LOCATION_ADDRESS, ORGANIZATION, ...), forced server side
             self.allow.update({label: v["regexes"] for label, v in config["allow_lists"].items() if v.get("regexes")})
-            self.block = {"EMAIL_ADDRESS": config["block_lists"]["EMAIL_ADDRESS"]["regexes"]}
+            # every block list in the config (EMAIL_ADDRESS, ORGANIZATION, ...)
+            self.block = {label: v["regexes"] for label, v in config["block_lists"].items() if v.get("regexes")}
             self.keep = (set(config["synthesize_labels"]) - {"PERSON"}
                          | {"EMPLOYEE_ID", "ACCOUNT_NUMBER", "LOCATION_ADDRESS", "USERNAME"})
             self.employee_id = [regex.compile(r) for r in config["custom_entities"]["employee_id"]["regexes"]]
@@ -138,6 +148,10 @@ class TextualRunner:
                     if self.keep is not None and label not in self.keep:
                         continue
                     if self.keep is None and label not in ORIGINAL_LABELS:
+                        continue
+                    # client-side guarantee of the ORGANIZATION block list (the server
+                    # also receives it, but its match semantics are its own)
+                    if label == "ORGANIZATION" and _ORG_BLOCK_RE.match(det.text or ""):
                         continue
                     spans.append({"label": label, "start": int(det.start), "end": int(det.end),
                                   "text": det.text, "score": round(score, 3)})

@@ -76,6 +76,11 @@
     "(?i)\\b[\\w.%+-]+@[\\w-]+\\b(?!\\.[A-Za-z])",
     "(?i)\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@[A-Za-z0-9.-]+\\b"
    ]
+  },
+  "ORGANIZATION": {
+   "regexes": [
+    "(?i)^\\s*(?:field marketing|hr|ops|poultry|rocky mountain|compliance|sales operations|group benefits|obesity|national campaigns|capital markets|medical affairs)\\s*[.,;:]?\\s*$"
+   ]
   }
  },
  "ignored_companies": []

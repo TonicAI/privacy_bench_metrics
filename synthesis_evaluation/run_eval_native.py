@@ -17,6 +17,8 @@ have the same definitions:
     NER recall          = detected / gold
     synthesis accuracy  = coherent / detected      (identity replacements count as misses)
     combined accuracy   = coherent / gold          (= their product)
+    synthesis + NER     = √(combined accuracy)     (geometric mean of the two stages — the
+                                                    headline combined score since v2.5)
 
 reported overall, per entity label, per file kind (eml, slack, pdf, docx, xlsx, csv), per character and
 per organization group. Every gold span in the file counts whether or not the pipeline produced output
@@ -78,14 +80,14 @@ def render_by_kind(by_kind: Dict[str, dict], diag: dict) -> str:
     lines = ["", "## By file kind", "",
              "Every gold span of every file counts; a file the pipeline never emitted contributes misses. "
              f"Spans excluded as `not_rendered`: {sum(diag.get('excluded_not_rendered', {}).values())}.", "",
-             "| kind | gold | detected | NER recall | synthesis accuracy | combined | predicted spans |", "|---|---|---|---|---|---|---|"]
+             "| kind | gold | detected | NER recall | synthesis accuracy | combined | synthesis + NER (√) | predicted spans |", "|---|---|---|---|---|---|---|---|"]
     for kind in list(native.KINDS) + ["messages", "documents"]:
         b = by_kind.get(kind)
         if not b:
             continue
         pred = diag.get("predicted", {}).get(kind, "") if kind in native.KINDS else ""
         lines.append(f"| {kind} | {b['gold']:,} | {b['detected']:,} | {_p(b['ner_recall'])} | {_p(b['synthesis_accuracy'])} | "
-                     f"{_p(b['combined_accuracy'])} | {pred} |")
+                     f"{_p(b['combined_accuracy'])} | {_p(b.get('synthesis_ner_accuracy'))} | {pred} |")
     other = diag.get("matched_other_label", {})
     if other:
         lines += ["", f"Gold spans overlapped only by a prediction with a different label (counted as NER misses): "
@@ -160,9 +162,11 @@ def main() -> int:
     metrics = compute_metrics(rows, realism_llm)
     metrics["by_kind"] = by_kind_metrics(rows, kinds, realism_llm)
     o = metrics["overall"]
-    print(f"\nscores — ner_recall={_p(o['ner_recall'])}  synthesis_accuracy={_p(o['synthesis_accuracy'])}  combined={_p(o['combined_accuracy'])}")
+    print(f"\nscores — ner_recall={_p(o['ner_recall'])}  synthesis_accuracy={_p(o['synthesis_accuracy'])}  "
+          f"combined={_p(o['combined_accuracy'])}  synthesis+NER(√)={_p(o.get('synthesis_ner_accuracy'))}")
     for kind, b in metrics["by_kind"].items():
-        print(f"  {kind:10s} recall={_p(b['ner_recall'])}  synthesis={_p(b['synthesis_accuracy'])}  combined={_p(b['combined_accuracy'])}  (gold {b['gold']:,})")
+        print(f"  {kind:10s} recall={_p(b['ner_recall'])}  synthesis={_p(b['synthesis_accuracy'])}  "
+              f"combined={_p(b['combined_accuracy'])}  synthesis+NER(√)={_p(b.get('synthesis_ner_accuracy'))}  (gold {b['gold']:,})")
     n_skipped, n_pairs = score_realism_llm.pair_counts(realism_llm)
     if n_pairs:
         print(f"judge: {n_skipped} of {n_pairs} pairs unjudged ({n_skipped / n_pairs:.1%}), counted as skipped")

@@ -235,7 +235,8 @@ def main() -> int:
 
     # The headline metrics (see metrics.py): detection-only NER recall,
     # synthesis accuracy over all detected gold spans (identity mappings
-    # always count as misses), and their product as the combined score.
+    # always count as misses), their product as the combined score, and
+    # its square root (the geometric mean) as the v2.5 headline.
     metrics = compute_metrics(rows, realism_llm)
     kinds = [(r.meta or {}).get("kind") or "" for r in rows]
     if any(kinds):
@@ -248,7 +249,8 @@ def main() -> int:
 
     print(f"\nscores — ner_recall={_p(o['ner_recall'])}  "
           f"synthesis_accuracy={_p(o['synthesis_accuracy'])}  "
-          f"combined={_p(o['combined_accuracy'])}")
+          f"combined={_p(o['combined_accuracy'])}  "
+          f"synthesis+NER(√)={_p(o.get('synthesis_ner_accuracy'))}")
 
     results = {
         "config": {
